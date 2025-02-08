@@ -1,10 +1,11 @@
+from RequestParser import RequestParser
+from ResponseBuilder import ResponseBuilder
 import calibration
 import beacon
 import network, socket, time
 import ntptime
 import urequests as requests
 from time import sleep
-import _thread
 import machine
 from micropython import const
 import uasyncio as asyncio
@@ -21,6 +22,7 @@ led = Pin("LED", Pin.OUT)
 led.value(0)
 tiltScanList = []
 targetTiltScan = {}
+lastLogged = {}
 wifiSettings = False
 SSID_complete = False
 KEY_complete = False
@@ -28,10 +30,11 @@ SSID = ''
 KEY = ''
 tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'PINK' ]
 
-async def logToCloud(color):
+async def logToCloud(color, cloudinterval):
     global targetTiltScan
+    global lastLogged
     try:
-        with open(color + '.json', 'r') as f:
+        with open('config-' + cloudinterval + '-' + color + '.json', 'r') as f:
          tiltAppData = ujson.load(f)
     except:
         print('couldnt open json settings file')
@@ -59,6 +62,7 @@ async def logToCloud(color):
         finally:
             if 'response' in locals(): # check to see if response was defined. Prevents an error if the request failed before response was assigned.
                 response.close()  # Important: Close the response to free up resources
+            lastLogged['color'] = time.time()
             break
 
 def saveWiFi(SSID, KEY):
@@ -272,6 +276,7 @@ async def startWebserver():
 async def create_settings_file(color, data):
   global tiltColors
   global targetTiltScan
+  print(targetTiltScan)
   for tiltScan in tiltScanList:
     if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] == color.split('-')[0]:
         targetTiltScan = tiltScan
@@ -286,7 +291,7 @@ async def create_settings_file(color, data):
       data['temp'] = targetTiltScan.get('major', 0)
       data['color'] = tiltColors[int(targetTiltScan.get('uuid', 'a495bb1')[6]) - 1]
   try:
-    with open(color + '.json', 'w') as f:
+    with open('config-' + data['cloudinterval'] + '-' + color + '.json', 'w') as f:
       f.write(ujson.dumps(data))
     print(f"File '{color}' created successfully.")
   except OSError as e:
@@ -361,19 +366,150 @@ async def sort_objects_by_key_value(objects, key):
     return sorted(objects, key=lambda obj: obj.get(key, 0), reverse=True) # Sort, using 0 as default value if key is missing.
 
 
+
+
+
+# coroutine to handle HTTP request
+async def handle_request(reader, writer):
+    global tiltScanList
+    try:
+        # allow other tasks to run while waiting for data
+        raw_request = await reader.read(2048)
+
+        request = RequestParser(raw_request)
+
+        response_builder = ResponseBuilder()
+
+        # filter out api request
+        if request.url_match('/'):
+            await tiltscanner(1100, 'tilts')
+            tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
+            response_builder.set_body_from_dict(tiltScanList)
+            tiltScanList.clear()
+            
+        #print(raw_request)
+        #print (request.query_string)
+        else:
+            tiltDataList = request.query_string.split('&')
+            tiltObject = {}
+            for data in tiltDataList:
+                tiltObject[data.split('=')[0]] = data.split('=')[1]
+            await tiltscanner(1100, 'tilts')
+            tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
+            await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject)
+            response_builder.set_body_from_dict(tiltScanList)
+
+        # try to serve static file
+        #response_builder.serve_static_file(request.url, "/api_index.html")
+
+        # build response message
+        response_builder.build_response()
+        # send reponse back to client
+        writer.write(response_builder.response)
+        # allow other tasks to run while data being sent
+        await writer.drain()
+        await writer.wait_closed()
+
+    except OSError as e:
+        print('connection error ' + str(e.errno) + " " + str(e))
+        
+# coroutine that will run as the neopixel update task
+async def neopixels():
+
+    counter = 0
+    while True:
+        if counter % 1000 == 0:
+            counter = 0
+        counter += 1
+        # 0 second pause to allow other tasks to run
+        await asyncio.sleep(0)
+
+# main coroutine to boot async tasks
 async def main():
- global wifiSettings
- asyncio.create_task(reset_button_reader())
- #await asyncio.sleep(5)#allow time to press reset button before starting server
- while True:
-    await startWebserver()
-    if wifiSettings == False:
-        beacon.startiBeacon(999, 999)
-        wifiSettings = True
-        while not SSID_complete:
-            await tiltscanner(0, 'wifi_config')
-        await startWebserver()
-             
-asyncio.run(main())
+    global config_files
+    global targetTiltScan
+    global tiltScanList
+    global wifiSettings
+    global SSID_complete
+    global KEY_complete
+    global SSID
+    global KEY
+    try:
+        with open('wifi.json', 'r') as f:
+         data = ujson.load(f)
+         SSID = data["SSID"]
+         KEY = data["KEY"]
+         wifiSettings = True
+    except:
+        wifiSettings = False
+        return
+    # Connect to WLAN
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(SSID, KEY)
+
+    # Wait for Wi-Fi connection
+    connection_timeout = 30
+    while connection_timeout > 0:
+        if wlan.status() >= 3:
+            break
+        connection_timeout -= 1
+        print('Waiting for Wi-Fi connection...')
+        time.sleep(1)
+
+    # Check if connection is successful
+    if wlan.status() != 3 and wifiSettings:
+        if delete_file('wifi.json'):
+         print("File deleted.")
+        else:
+          print("Failed to delete file.")
+        machine.soft_reset()
+    else:
+        led.value(1)
+        print('Connection successful!')
+        await set_time_from_ntp()
+        network_info = wlan.ifconfig()
+        print('Connected to ' + network_info[0])
+        ipAddr = ip_to_uint16(network_info[0])
+        beacon.startiBeacon(ipAddr[0], ipAddr[1])
+        wifiSettings == True
+    # start web server task
+    print('Setting up webserver...')
+    server = asyncio.start_server(handle_request, "0.0.0.0", 80)
+    asyncio.create_task(server)
+
+    # start top 4 neopixel updating task
+    asyncio.create_task(neopixels())
+
+    # main task to control automatic logging
+    counter = 0
+    while True:
+        if counter % 30000 == 0:
+            led.toggle()
+            await tiltscanner(1100, 'tilts')
+            for tiltScan in tiltScanList:
+                print(tiltScan)
+                for config_file in os.listdir():
+                    if config_file.startswith('config-'):
+                        config = config_file[:-5]
+                        if config.split('-')[2] == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1]:
+                            if tiltScan.get('minor', 'unknown') > 5000:
+                                targetTiltScan = tiltScan
+                                await logToCloud(tiltColors[int(targetTiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1])
+                            else:
+                                targetTiltScan = tiltScan
+                                await logToCloud(tiltColors[int(targetTiltScan.get('uuid', 'a495bb1')[6]) - 1], config_file.split('-')[1])
+            
+            tiltScanList.clear()
+        counter += 1
+        # 0 second pause to allow other tasks to run
+        await asyncio.sleep(0)
 
 
+# start asyncio task and loop
+try:
+    # start the main async tasks
+    asyncio.run(main())
+finally:
+    # reset and start a new event loop for the task scheduler
+    asyncio.new_event_loop()
