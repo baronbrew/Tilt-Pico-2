@@ -30,9 +30,22 @@ SSID = ''
 KEY = ''
 tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'PINK' ]
 
-async def logToCloud(color, cloudinterval):
-    global targetTiltScan
+async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
+    # Only log if interval has passed
+    for config_file in os.listdir():
+        if config_file.startswith('config-'):
+            config = config_file[:-5]
+            if len(config.split('-')) == 3:
+                if config.split('-')[2] == color:
+                    if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time() + 870:
+                        print(color + ' already logged within interval')
+                        return False
+            elif len(config.split('-')) == 4:
+                if config.split('-')[2] + '-' + config.split('-')[3] == color: 
+                    if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time() + 870:
+                        print(color + ' already logged within interval')
+                        return False
     try:
         with open('config-' + cloudinterval + '-' + color + '.json', 'r') as f:
          tiltAppData = ujson.load(f)
@@ -40,16 +53,32 @@ async def logToCloud(color, cloudinterval):
         print('couldnt open json settings file')
         return False
     timeZoneOffsetSec = int(tiltAppData.get('timezoneoffsetsec', '0'))
-    unixTimeStampLocal = targetTiltScan.get('timestamp', 'unknown') - timeZoneOffsetSec
+    unixTimeStampLocal = passedTiltScan.get('timestamp', 0) - timeZoneOffsetSec
     unixFractionOfDay = 115.74 * (unixTimeStampLocal - (int((str(unixTimeStampLocal / 86400)).split('.')[0]) * 86400))
     excelTimeStamp = (str(unixTimeStampLocal / 86400 + 25569)).split('.')[0] + '.' + (str(unixFractionOfDay)).split('.')[0]
-    print('Timepoint=' + excelTimeStamp + '&SG=' + str(tiltAppData.get('minor', 'unknown')) + '&Temp=' + str(tiltAppData.get('major', 'unknown')) + '&Color=' + tiltAppData.get('color', 'unknown').split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
+    if len(color.split('-')) == 1:
+        precal_temp = passedTiltScan.get('major', 0)
+        precal_sg = passedTiltScan.get('minor', 0) / 1000
+    else:
+        precal_temp = passedTiltScan.get('major', 0) / 10
+        precal_sg = passedTiltScan.get('minor', 0) / 10000
+    tilttempcal = processCalibrationValues(tiltAppData.get('tilttempcal', 'unknown'))
+    actualtempcal = processCalibrationValues(tiltAppData.get('actualtempcal', 'unknown'))
+    temp = calibration.calibrate_value(tilttempcal, actualtempcal, precal_temp)
+    tiltsgcal = processCalibrationValues(tiltAppData.get('tiltSGcal', 'unknown'))
+    actualsgcal = processCalibrationValues(tiltAppData.get('actualSGcal', 'unknown'))
+    sg = calibration.calibrate_value(tiltsgcal, actualsgcal, precal_sg)
+    print(tiltsgcal)
+    print(actualsgcal)
+    print(sg)
+    
+    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + tiltAppData.get('color', 'unknown').split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
     print(tiltAppData.get('color','unknown'))
     while True:
         try:
             print("sending...")
-            response = requests.post(tiltAppData.get('cloudurls','unknown'), headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(tiltAppData.get('sg', 'unknown')) + '&Temp=' + str(tiltAppData.get('temp', 'unknown')) + '&Color=' + tiltAppData.get('color', 'unknown').split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
-            targetTiltScan['timestamp'] = 0
+            response = requests.post(tiltAppData.get('cloudurls','unknown'), headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + tiltAppData.get('color', 'unknown').split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
+            #targetTiltScan['timestamp'] = 0
             print(response.status_code)
             if response.status_code == 200:
                 print(response.text)  # Process the successful response
@@ -62,8 +91,23 @@ async def logToCloud(color, cloudinterval):
         finally:
             if 'response' in locals(): # check to see if response was defined. Prevents an error if the request failed before response was assigned.
                 response.close()  # Important: Close the response to free up resources
-            lastLogged['color'] = time.time()
+            lastLogged[color] = time.time()
+            print(lastLogged)
             break
+
+def processCalibrationValues(cal_points):
+        proc_cal_points = []
+        try:
+            if len(cal_points.split(',')) > 0:
+                for cal_point in cal_points.split(','):
+                    proc_cal_points.append(float(cal_point))
+                return proc_cal_points
+            else:
+                return proc_cal_points
+        except:
+            return proc_cal_points
+    
+
 
 def saveWiFi(SSID, KEY):
  jsonWiFi = { "SSID" : SSID, "KEY" : KEY }
@@ -276,7 +320,6 @@ async def startWebserver():
 async def create_settings_file(color, data):
   global tiltColors
   global targetTiltScan
-  print(targetTiltScan)
   for tiltScan in tiltScanList:
     if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] == color.split('-')[0]:
         targetTiltScan = tiltScan
@@ -290,6 +333,15 @@ async def create_settings_file(color, data):
       data['sg'] = targetTiltScan.get('minor', 1000) / 1000
       data['temp'] = targetTiltScan.get('major', 0)
       data['color'] = tiltColors[int(targetTiltScan.get('uuid', 'a495bb1')[6]) - 1]
+  for config_file in os.listdir():
+        if config_file.startswith('config-'):
+            config = config_file[:-5]
+            if len(config.split('-')) == 3:
+                if config.split('-')[2] == color:
+                    delete_file(config_file)
+            elif len(config.split('-')) == 4:
+                if config.split('-')[2] + '-' + config.split('-')[3] == color:
+                    delete_file(config_file)
   try:
     with open('config-' + data['cloudinterval'] + '-' + color + '.json', 'w') as f:
       f.write(ujson.dumps(data))
@@ -427,7 +479,6 @@ async def neopixels():
 # main coroutine to boot async tasks
 async def main():
     global config_files
-    global targetTiltScan
     global tiltScanList
     global wifiSettings
     global SSID_complete
@@ -488,17 +539,14 @@ async def main():
             led.toggle()
             await tiltscanner(1100, 'tilts')
             for tiltScan in tiltScanList:
-                print(tiltScan)
                 for config_file in os.listdir():
                     if config_file.startswith('config-'):
                         config = config_file[:-5]
                         if config.split('-')[2] == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1]:
                             if tiltScan.get('minor', 'unknown') > 5000:
-                                targetTiltScan = tiltScan
-                                await logToCloud(tiltColors[int(targetTiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1])
+                                await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
                             else:
-                                targetTiltScan = tiltScan
-                                await logToCloud(tiltColors[int(targetTiltScan.get('uuid', 'a495bb1')[6]) - 1], config_file.split('-')[1])
+                                await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1], config_file.split('-')[1], tiltScan)
             
             tiltScanList.clear()
         counter += 1

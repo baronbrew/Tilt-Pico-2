@@ -1,6 +1,7 @@
 def calibrate_value(measured_points, actual_points, current_measured):
     if not (measured_points and actual_points and len(measured_points) == len(actual_points)):
-        return None  # Handle invalid input
+        print('invalid input')
+        return current_measured  # Handle invalid input
 
     # Find the closest calibration points
     lower_index = -1
