@@ -72,6 +72,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     cloudurls = tiltAppData.get('cloudurls', 'unknown').split(',')
     led.value(1)
     for cloudurl in cloudurls:
+     if cloudurl is not '':
         print(cloudurl)
         while True:
             try:
@@ -142,7 +143,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   async with aioble.scan(SCANLENGTH, interval_us=500*1000, window_us=500*1000, active=False) as scanner:
     async for result in scanner:
      if SCANFOR == 'wifi_config':
-        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -60:
+        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -70:
          led_flash_interval = [4, True]
          major = int(binascii.hexlify(result.adv_data[22:24]), 16)
          minor = int(binascii.hexlify(result.adv_data[24:26]), 16)
@@ -354,7 +355,6 @@ async def handle_request(reader, writer):
             await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject)
             response_builder.set_body_from_dict(tiltScanList)
         elif request.url_match('/reset'):
-            led.value(1)
             beacon.startiBeacon(999, 999)
             reset = delete_file('wifi.json')
 
@@ -368,9 +368,8 @@ async def handle_request(reader, writer):
         # allow other tasks to run while data being sent
         await writer.drain()
         await writer.wait_closed()
-        led.value(0)
         if reset:
-            asyncio.sleep(5)
+            await asyncio.sleep(5)
             machine.soft_reset()
 
     except OSError as e:
@@ -413,6 +412,7 @@ async def main():
             await tiltscanner(0, 'wifi_config')
     led_flash_interval = [10, False]
     led.value(0)
+    beacon.stopiBeacon()
     # Connect to WLAN
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
@@ -439,10 +439,6 @@ async def main():
         led.value(0)
     else:
         print("Connection failed")
-        if delete_file('wifi.json'):
-         print("File deleted.")
-        else:
-          print("Failed to delete file.")
         beacon.startiBeacon(999, 997)
         time.sleep(10)
         machine.soft_reset()
