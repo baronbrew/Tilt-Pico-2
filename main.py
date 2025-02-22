@@ -68,7 +68,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     tiltsgcal = processCalibrationValues(tiltAppData.get('tiltSGcal', 'unknown'))
     actualsgcal = processCalibrationValues(tiltAppData.get('actualSGcal', 'unknown'))
     sg = calibration.calibrate_value(tiltsgcal, actualsgcal, precal_sg)
-    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + tiltAppData.get('color', 'unknown').split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
+    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
     cloudurls = tiltAppData.get('cloudurls', 'unknown').split(',')
     led.value(1)
     for cloudurl in cloudurls:
@@ -221,6 +221,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
 async def create_settings_file(color, data):
   global tiltColors
   global targetTiltScan
+  print(data)
   for tiltScan in tiltScanList:
     if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] == color.split('-')[0]:
         targetTiltScan = tiltScan
