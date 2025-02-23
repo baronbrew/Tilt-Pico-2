@@ -68,7 +68,11 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     tiltsgcal = processCalibrationValues(tiltAppData.get('tiltSGcal', 'unknown'))
     actualsgcal = processCalibrationValues(tiltAppData.get('actualSGcal', 'unknown'))
     sg = calibration.calibrate_value(tiltsgcal, actualsgcal, precal_sg)
-    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
+    if lastLogged.get(color, 0) < 0:
+        comment = 'Tilt Pico Started'
+    else:
+        comment = ''
+    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
     cloudurls = tiltAppData.get('cloudurls', 'unknown').split(',')
     led.value(1)
     for cloudurl in cloudurls:
@@ -77,7 +81,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
         while True:
             try:
                 print("sending...") 
-                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
+                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
                 print(response.status_code)
                 if response.status_code == 200:
                     print(response.text)  # Process the successful response
@@ -250,6 +254,7 @@ async def create_settings_file(color, data):
     print(f"File '{color}' created successfully.")
   except OSError as e:
     print(f"Error creating file: {e}")
+  
     
 def ip_to_uint16(ip_address):
 
@@ -355,6 +360,7 @@ async def handle_request(reader, writer):
             tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
             await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject)
             response_builder.set_body_from_dict(tiltScanList)
+            lastLogged[tiltObject.get('color', 'unknown')] = -900
         elif request.url_match('/reset'):
             beacon.startiBeacon(999, 999)
             reset = delete_file('wifi.json')
@@ -369,6 +375,7 @@ async def handle_request(reader, writer):
         # allow other tasks to run while data being sent
         await writer.drain()
         await writer.wait_closed()
+        led.value(0)
         if reset:
             await asyncio.sleep(5)
             machine.soft_reset()
@@ -389,6 +396,17 @@ async def flash_led():
             # 0 second pause to allow other tasks to run
             await asyncio.sleep_ms(50)
         await asyncio.sleep_ms(50)
+
+
+async def getMac(config_file_prefix):
+    try:
+        with open(config_file_prefix + '.json', 'r') as f:
+         tiltAppData = ujson.load(f)
+    except:
+        print('couldnt open json settings file')
+        led.value(0)
+        return False
+    return tiltAppData.get('mac','unknown')
 
 # main coroutine to boot async tasks
 async def main():
@@ -461,7 +479,8 @@ async def main():
                 for config_file in os.listdir():
                     if config_file.startswith('config-'):
                         config = config_file[:-5]
-                        if config.split('-')[2] == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1]:
+                        configMac = await getMac(config)
+                        if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
                             if tiltScan.get('minor', 'unknown') > 5000:
                                 await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
                             else:
