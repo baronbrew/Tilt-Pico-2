@@ -69,7 +69,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     actualsgcal = processCalibrationValues(tiltAppData.get('actualSGcal', 'unknown'))
     sg = calibration.calibrate_value(tiltsgcal, actualsgcal, precal_sg)
     if lastLogged.get(color, 0) < 0:
-        comment = 'Tilt Pico Started'
+        comment = 'Tilt%20Pico%20Connected'
     else:
         comment = ''
     print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
@@ -122,7 +122,6 @@ def convertToExcelTime(gmt_time, timeZoneOffsetSec):
     else:
         excelDayOnly = int(unixTimeStampLocal / 86400 + 25569)
     excelTimeStamp = str(excelDayOnly) + '.' + "{:07d}".format(int(unixFractionOfDay))
-    print(excelTimeStamp)
     return excelTimeStamp
 
 def saveWiFi(SSID, KEY):
@@ -148,7 +147,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
     async for result in scanner:
      if SCANFOR == 'wifi_config':
         if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -70:
-         led_flash_interval = [4, True]
+         led_flash_interval = [1, True]
          major = int(binascii.hexlify(result.adv_data[22:24]), 16)
          minor = int(binascii.hexlify(result.adv_data[24:26]), 16)
          hex_str = binascii.hexlify(result.adv_data[10:22]).decode('utf-8')
@@ -221,6 +220,8 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
           RSSI = result.rssi
           TIMESTAMP = time.time()
           tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
+          if len(tiltScanList) >= 16:
+              break
 
 async def create_settings_file(color, data):
   global tiltColors
@@ -277,7 +278,7 @@ async def reset_button_reader():
         if rp2.bootsel_button() == 1:
             if delete_file('wifi.json'):
                 await asyncio.sleep(2)
-                machine.soft_reset()
+                machine.reset()
         await asyncio.sleep_ms(10)
 
 def delete_file(filename):
@@ -438,29 +439,36 @@ async def main():
     if not wlan.isconnected():
         print(f"Connecting to {SSID}...")
         wlan.connect(SSID, KEY)  # Connect to the network
-
         # Wait for connection with timeout
         timeout = 30  # seconds
         for _ in range(timeout * 10):  # Check every 100ms
             if wlan.isconnected():
                 break
-            asyncio.sleep_ms(100)  # Non-blocking delay
+            await asyncio.sleep_ms(100)  # Non-blocking delay
     if wlan.isconnected():
         print(f"Connected to {SSID}, syncing time with NTP")
         if not await set_time_from_ntp():
             beacon.startiBeacon(999, 998) # can't connect to NTP error beacon
-            time.sleep(10)
-            machine.soft_reset()
+            time.sleep(5)
+            machine.reset()
         print("Connected to Wi-Fi")
         print(f"IP address: {wlan.ifconfig()}")  # Print the IP address
         ipAddr = ip_to_uint16(wlan.ifconfig()[0])
         beacon.startiBeacon(ipAddr[0], ipAddr[1])
         led.value(0)
-    else:
-        print("Connection failed")
+    elif not wlan.isconnected():
+        print("Connection failed, trying again.")
+        timeout = 30  # seconds
+        for _ in range(timeout * 10):  # Check every 100ms
+            if wlan.isconnected():
+                break
+            await asyncio.sleep_ms(100)  # Non-blocking delay
+        print("Still not connected, resetting")
         beacon.startiBeacon(999, 997)
-        time.sleep(10)
-        machine.soft_reset()
+        time.sleep(5)
+        machine.reset()
+    else:
+        machine.reset()
         
     # start web server task
     print('Setting up webserver...')
