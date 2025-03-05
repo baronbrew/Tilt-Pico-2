@@ -73,3 +73,6 @@ def startiBeacon(major, minor):
     )
 
     beacon.advertise()
+    
+def stopiBeacon():
+    bt.BLE().gap_advertise(None)
