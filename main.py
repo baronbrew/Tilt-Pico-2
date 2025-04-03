@@ -20,10 +20,10 @@ import os
 from machine import Pin
 led = Pin("LED", Pin.OUT)
 led.value(0)
+led_flash_interval = [5, False]
 tiltScanList = []
 targetTiltScan = {}
 lastLogged = {}
-wifiSettings = False
 SSID_complete = False
 KEY_complete = False
 SSID = ''
@@ -38,24 +38,24 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
             config = config_file[:-5]
             if len(config.split('-')) == 3:
                 if config.split('-')[2] == color:
-                    if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time() + 870:
+                    if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
                         print(color + ' already logged within interval')
+                        led.value(0)
                         return False
             elif len(config.split('-')) == 4:
                 if config.split('-')[2] + '-' + config.split('-')[3] == color: 
-                    if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time() + 870:
+                    if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
                         print(color + ' already logged within interval')
+                        led.value(0)
                         return False
     try:
         with open('config-' + cloudinterval + '-' + color + '.json', 'r') as f:
          tiltAppData = ujson.load(f)
     except:
         print('couldnt open json settings file')
+        led.value(0)
         return False
-    timeZoneOffsetSec = int(tiltAppData.get('timezoneoffsetsec', '0'))
-    unixTimeStampLocal = passedTiltScan.get('timestamp', 0) - timeZoneOffsetSec
-    unixFractionOfDay = 115.74 * (unixTimeStampLocal - (int((str(unixTimeStampLocal / 86400)).split('.')[0]) * 86400))
-    excelTimeStamp = (str(unixTimeStampLocal / 86400 + 25569)).split('.')[0] + '.' + (str(unixFractionOfDay)).split('.')[0]
+    excelTimeStamp = convertToExcelTime(int(passedTiltScan.get('timestamp', '0')), int(tiltAppData.get('timezoneoffsetsec', '0')))
     if len(color.split('-')) == 1:
         precal_temp = passedTiltScan.get('major', 0)
         precal_sg = passedTiltScan.get('minor', 0) / 1000
@@ -68,32 +68,38 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     tiltsgcal = processCalibrationValues(tiltAppData.get('tiltSGcal', 'unknown'))
     actualsgcal = processCalibrationValues(tiltAppData.get('actualSGcal', 'unknown'))
     sg = calibration.calibrate_value(tiltsgcal, actualsgcal, precal_sg)
-    print(tiltsgcal)
-    print(actualsgcal)
-    print(sg)
-    
-    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + tiltAppData.get('color', 'unknown').split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
-    print(tiltAppData.get('color','unknown'))
-    while True:
-        try:
-            print("sending...")
-            response = requests.post(tiltAppData.get('cloudurls','unknown'), headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + tiltAppData.get('color', 'unknown').split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=')
-            #targetTiltScan['timestamp'] = 0
-            print(response.status_code)
-            if response.status_code == 200:
-                print(response.text)  # Process the successful response
-            elif response.status_code == 400:
-                print("Expected error from Google Sheets")
-            else:
-                print(f"Error: HTTP {response.status_code}")  # Handle other errors
-        except OSError as e:
-            print(f"Error: Network issue or other error: {e}")
-        finally:
-            if 'response' in locals(): # check to see if response was defined. Prevents an error if the request failed before response was assigned.
-                response.close()  # Important: Close the response to free up resources
-            lastLogged[color] = time.time()
-            print(lastLogged)
-            break
+    if lastLogged.get(color, 0) < 0:
+        comment = 'Tilt%20Pico%20Connected'
+    else:
+        comment = ''
+    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
+    cloudurls = tiltAppData.get('cloudurls', 'unknown').split(',')
+    led.value(1)
+    for cloudurl in cloudurls:
+     if cloudurl is not '':
+        print(cloudurl)
+        while True:
+            try:
+                print("sending...") 
+                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
+                print(response.status_code)
+                if response.status_code == 200:
+                    print(response.text)  # Process the successful response
+                elif response.status_code == 400:
+                    print("Bad Request")
+                else:
+                    print(f"Error: HTTP {response.status_code}")  # Handle other errors
+            except OSError as e:
+                print(f"Error: Network issue or other error: {e}")
+                asyncio.sleep(5)
+                machine.soft_reset()
+            finally:
+                if 'response' in locals(): # check to see if response was defined. Prevents an error if the request failed before response was assigned.
+                    response.close()  # Important: Close the response to free up resources
+                lastLogged[color] = time.time()
+                print(lastLogged)
+                break
+    led.value(0)
 
 def processCalibrationValues(cal_points):
         proc_cal_points = []
@@ -107,20 +113,28 @@ def processCalibrationValues(cal_points):
         except:
             return proc_cal_points
     
-
+def convertToExcelTime(gmt_time, timeZoneOffsetSec):
+    unixTimeStampLocal = gmt_time - timeZoneOffsetSec
+    unixFractionOfDay = 115.74 * (unixTimeStampLocal - int(unixTimeStampLocal / 86400) * 86400)
+    if unixFractionOfDay < 0:
+        excelDayOnly = int((unixTimeStampLocal / 86400 + 25569) - 1)
+        unixFractionOfDay += 10000000
+    else:
+        excelDayOnly = int(unixTimeStampLocal / 86400 + 25569)
+    excelTimeStamp = str(excelDayOnly) + '.' + "{:07d}".format(int(unixFractionOfDay))
+    return excelTimeStamp
 
 def saveWiFi(SSID, KEY):
  jsonWiFi = { "SSID" : SSID, "KEY" : KEY }
  try:
   with open('wifi.json', 'w') as f:
    ujson.dump(jsonWiFi, f)
-   wifiSettings = True
  except:
         print("Error! Could not save")
      
 
 async def tiltscanner(SCANLENGTH, SCANFOR):
-  global led
+  global led_flash_interval
   global SSID_complete
   global KEY_complete
   global SSID
@@ -132,8 +146,8 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   async with aioble.scan(SCANLENGTH, interval_us=500*1000, window_us=500*1000, active=False) as scanner:
     async for result in scanner:
      if SCANFOR == 'wifi_config':
-        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -60:
-         led.value(1)
+        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -70:
+         led_flash_interval = [1, True]
          major = int(binascii.hexlify(result.adv_data[22:24]), 16)
          minor = int(binascii.hexlify(result.adv_data[24:26]), 16)
          hex_str = binascii.hexlify(result.adv_data[10:22]).decode('utf-8')
@@ -191,8 +205,10 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
            print(KEY)
            KEY_complete = True
          if SSID_complete and KEY_complete:
-          saveWiFi(SSID.replace('\u0000', ''), KEY.replace('\u0000', ''))
-          led.value(0)
+          SSID = SSID.replace('\u0000', '')
+          KEY = KEY.replace('\u0000', '')
+          saveWiFi(SSID, KEY)
+          led_flash_interval = [4, False]
           break
      if SCANFOR == 'tilts':
       if binascii.hexlify(result.adv_data[9:12]) == b'a495bb' and binascii.hexlify(result.adv_data[13:25]) == b'c5b14b44b5121370f02d74de':
@@ -204,122 +220,13 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
           RSSI = result.rssi
           TIMESTAMP = time.time()
           tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
-# HTML template for the webpage
-async def webpage():
- return await tiltscanner(1100, 'tilts')
-
-async def startWebserver():
-    global tiltScanList
-    global wifiSettings
-    global SSID_complete
-    global KEY_complete
-    global SSID
-    global KEY
-    try:
-        with open('wifi.json', 'r') as f:
-         data = ujson.load(f)
-         SSID = data["SSID"]
-         KEY = data["KEY"]
-         wifiSettings = True
-    except:
-        wifiSettings = False
-        return
-    # Connect to WLAN
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    wlan.connect(SSID, KEY)
-
-    # Wait for Wi-Fi connection
-    connection_timeout = 30
-    while connection_timeout > 0:
-        if wlan.status() >= 3:
-            break
-        connection_timeout -= 1
-        print('Waiting for Wi-Fi connection...')
-        time.sleep(1)
-
-    # Check if connection is successful
-    if wlan.status() != 3 and wifiSettings:
-        if delete_file('wifi.json'):
-         print("File deleted.")
-        else:
-          print("Failed to delete file.")
-        machine.soft_reset()
-    else:
-        led.value(1)
-        print('Connection successful!')
-        await set_time_from_ntp()
-        network_info = wlan.ifconfig()
-        print('Connected to ' + network_info[0])
-        ipAddr = ip_to_uint16(network_info[0])
-        beacon.startiBeacon(ipAddr[0], ipAddr[1])
-        wifiSettings == True
-
-    # Set up socket and start listening
-    addr = socket.getaddrinfo('0.0.0.0', 80)[0][-1]
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(addr)
-    s.listen()
-
-    print('Listening on', addr)
-    # Main loop to listen for connections
-    while True:
-        try:
-            conn, addr = s.accept()
-            print('Got a connection from', addr)
-            led.value(0)
-            
-            # Receive and parse the request
-            request = conn.recv(1024)
-            request = str(request)
-            #print('Request content = %s' % request)
-
-            try:
-                request = request.split('\\r\\n')[0]
-                request = request.split(' ')[1]
-                requestList = request.split('?')
-                print('Request:', request)
-            except IndexError:
-                pass
-            # Process the request and update variables
-            if requestList[0] == "/reset":
-                if delete_file('wifi.json'):
-                 conn.send('HTTP/1.0 200 OK\r\nContent-type: application/json\r\n\r\n')
-                 conn.send('"status" : "WiFi settings file deleted"')
-                else:
-                 conn.send('HTTP/1.0 200 OK\r\nContent-type: application/json\r\n\r\n')
-                 conn.send('"status" : "Failed to delete WiFi settings file"')
-                conn.close()
-                machine.soft_reset()
-            elif requestList[0] == '/sync':
-                tiltDataList = requestList[1].split('&')
-                tiltObject = {}
-                for data in tiltDataList:
-                    tiltObject[data.split('=')[0]] = data.split('=')[1]
-                await tiltscanner(1100, 'tilts')
-                tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
-                await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject)
-                await logToCloud(tiltObject.get('color', 'unknown'))
-            elif request == '/value?':
-                random_value = random.randint(0, 20)
-            else:
-                await tiltscanner(1100, 'tilts')
-                tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
-             
-            # Send the HTTP response and close the connection
-            conn.send('HTTP/1.0 200 OK\r\nContent-type: application/json\r\n\r\n')
-            conn.send(ujson.dumps(tiltScanList))
-            tiltScanList.clear()
-            conn.close()
-
-        except OSError as e:
-            conn.close()
-            print('Connection closed')
+          if len(tiltScanList) >= 16:
+              break
 
 async def create_settings_file(color, data):
   global tiltColors
   global targetTiltScan
+  print(data)
   for tiltScan in tiltScanList:
     if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] == color.split('-')[0]:
         targetTiltScan = tiltScan
@@ -348,6 +255,7 @@ async def create_settings_file(color, data):
     print(f"File '{color}' created successfully.")
   except OSError as e:
     print(f"Error creating file: {e}")
+  
     
 def ip_to_uint16(ip_address):
 
@@ -369,7 +277,8 @@ async def reset_button_reader():
     while True:
         if rp2.bootsel_button() == 1:
             if delete_file('wifi.json'):
-             await asyncio.sleep(0.2)
+                await asyncio.sleep(2)
+                machine.reset()
         await asyncio.sleep_ms(10)
 
 def delete_file(filename):
@@ -399,7 +308,6 @@ async def set_time_from_ntp(retries=3, delay=1):
             else:
                 print("NTP synchronization failed after multiple retries.")
             continue # Continue to the next attempt.
-
     return False  # All attempts failed
 
 async def sort_objects_by_key_value(objects, key):
@@ -424,6 +332,8 @@ async def sort_objects_by_key_value(objects, key):
 # coroutine to handle HTTP request
 async def handle_request(reader, writer):
     global tiltScanList
+    global led_flash_interval
+    reset = False
     try:
         # allow other tasks to run while waiting for data
         raw_request = await reader.read(2048)
@@ -434,22 +344,27 @@ async def handle_request(reader, writer):
 
         # filter out api request
         if request.url_match('/'):
+            led.value(1)
             await tiltscanner(1100, 'tilts')
             tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
             response_builder.set_body_from_dict(tiltScanList)
-            tiltScanList.clear()
-            
+            tiltScanList.clear() 
         #print(raw_request)
         #print (request.query_string)
-        else:
+        elif request.url_match('/sync'):
+            led.value(1)
+            await tiltscanner(1100, 'tilts')
             tiltDataList = request.query_string.split('&')
             tiltObject = {}
             for data in tiltDataList:
                 tiltObject[data.split('=')[0]] = data.split('=')[1]
-            await tiltscanner(1100, 'tilts')
             tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
             await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject)
             response_builder.set_body_from_dict(tiltScanList)
+            lastLogged[tiltObject.get('color', 'unknown')] = -900
+        elif request.url_match('/reset'):
+            beacon.startiBeacon(999, 999)
+            reset = delete_file('wifi.json')
 
         # try to serve static file
         #response_builder.serve_static_file(request.url, "/api_index.html")
@@ -461,26 +376,44 @@ async def handle_request(reader, writer):
         # allow other tasks to run while data being sent
         await writer.drain()
         await writer.wait_closed()
+        led.value(0)
+        if reset:
+            await asyncio.sleep(5)
+            machine.soft_reset()
 
     except OSError as e:
         print('connection error ' + str(e.errno) + " " + str(e))
         
-# coroutine that will run as the neopixel update task
-async def neopixels():
-
+# coroutine that will run led flashing indicators
+async def flash_led():
+    global led_flash_interval
     counter = 0
     while True:
-        if counter % 1000 == 0:
-            counter = 0
-        counter += 1
-        # 0 second pause to allow other tasks to run
-        await asyncio.sleep(0)
+        if led_flash_interval[1]:
+            if counter > led_flash_interval[0]:
+                led.toggle()
+                counter = 0
+            counter += 1
+            # 0 second pause to allow other tasks to run
+            await asyncio.sleep_ms(50)
+        await asyncio.sleep_ms(50)
+
+
+async def getMac(config_file_prefix):
+    try:
+        with open(config_file_prefix + '.json', 'r') as f:
+         tiltAppData = ujson.load(f)
+    except:
+        print('couldnt open json settings file')
+        led.value(0)
+        return False
+    return tiltAppData.get('mac','unknown')
 
 # main coroutine to boot async tasks
 async def main():
+    global led_flash_interval
     global config_files
     global tiltScanList
-    global wifiSettings
     global SSID_complete
     global KEY_complete
     global SSID
@@ -490,68 +423,81 @@ async def main():
          data = ujson.load(f)
          SSID = data["SSID"]
          KEY = data["KEY"]
-         wifiSettings = True
     except:
-        wifiSettings = False
-        return
+        led_flash_interval = [10, True]
+        asyncio.create_task(flash_led())
+        beacon.startiBeacon(999, 999)
+        while not SSID_complete and not KEY_complete:
+            print('Waiting for wifi SSID and KEY from app...')
+            await tiltscanner(0, 'wifi_config')
+    led_flash_interval = [10, False]
+    led.value(0)
+    beacon.stopiBeacon()
     # Connect to WLAN
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    wlan.connect(SSID, KEY)
-
-    # Wait for Wi-Fi connection
-    connection_timeout = 30
-    while connection_timeout > 0:
-        if wlan.status() >= 3:
-            break
-        connection_timeout -= 1
-        print('Waiting for Wi-Fi connection...')
-        time.sleep(1)
-
-    # Check if connection is successful
-    if wlan.status() != 3 and wifiSettings:
-        if delete_file('wifi.json'):
-         print("File deleted.")
-        else:
-          print("Failed to delete file.")
-        machine.soft_reset()
-    else:
-        led.value(1)
-        print('Connection successful!')
-        await set_time_from_ntp()
-        network_info = wlan.ifconfig()
-        print('Connected to ' + network_info[0])
-        ipAddr = ip_to_uint16(network_info[0])
+    if not wlan.isconnected():
+        print(f"Connecting to {SSID}...")
+        wlan.connect(SSID, KEY)  # Connect to the network
+        # Wait for connection with timeout
+        timeout = 30  # seconds
+        for _ in range(timeout * 10):  # Check every 100ms
+            if wlan.isconnected():
+                break
+            await asyncio.sleep_ms(100)  # Non-blocking delay
+    if wlan.isconnected():
+        print(f"Connected to {SSID}, syncing time with NTP")
+        if not await set_time_from_ntp():
+            beacon.startiBeacon(999, 998) # can't connect to NTP error beacon
+            time.sleep(5)
+            machine.reset()
+        print("Connected to Wi-Fi")
+        print(f"IP address: {wlan.ifconfig()}")  # Print the IP address
+        ipAddr = ip_to_uint16(wlan.ifconfig()[0])
         beacon.startiBeacon(ipAddr[0], ipAddr[1])
-        wifiSettings == True
+        led.value(0)
+    elif not wlan.isconnected():
+        print("Connection failed, trying again.")
+        timeout = 30  # seconds
+        for _ in range(timeout * 10):  # Check every 100ms
+            if wlan.isconnected():
+                break
+            await asyncio.sleep_ms(100)  # Non-blocking delay
+        print("Still not connected, resetting")
+        beacon.startiBeacon(999, 997)
+        time.sleep(5)
+        machine.reset()
+    else:
+        machine.reset()
+        
     # start web server task
     print('Setting up webserver...')
     server = asyncio.start_server(handle_request, "0.0.0.0", 80)
     asyncio.create_task(server)
 
-    # start top 4 neopixel updating task
-    asyncio.create_task(neopixels())
+    # start updating task
+    asyncio.create_task(reset_button_reader())
 
     # main task to control automatic logging
     counter = 0
     while True:
         if counter % 30000 == 0:
-            led.toggle()
             await tiltscanner(1100, 'tilts')
             for tiltScan in tiltScanList:
                 for config_file in os.listdir():
                     if config_file.startswith('config-'):
                         config = config_file[:-5]
-                        if config.split('-')[2] == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1]:
+                        configMac = await getMac(config)
+                        if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
                             if tiltScan.get('minor', 'unknown') > 5000:
                                 await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
                             else:
                                 await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1], config_file.split('-')[1], tiltScan)
-            
             tiltScanList.clear()
         counter += 1
         # 0 second pause to allow other tasks to run
         await asyncio.sleep(0)
+        led.value(0)
 
 
 # start asyncio task and loop
