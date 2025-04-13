@@ -17,6 +17,7 @@ import sys
 import binascii
 import ujson
 import os
+import gc
 from machine import Pin
 led = Pin("LED", Pin.OUT)
 led.value(0)
@@ -32,27 +33,34 @@ tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'P
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
+    print(lastLogged)
     # Only log if interval has passed
     for config_file in os.listdir():
         if config_file.startswith('config-'):
             config = config_file[:-5]
-            if len(config.split('-')) == 3:
-                if config.split('-')[2] == color:
-                    if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
-                        print(color + ' already logged within interval')
-                        led.value(0)
-                        return False
-            elif len(config.split('-')) == 4:
-                if config.split('-')[2] + '-' + config.split('-')[3] == color: 
-                    if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
-                        print(color + ' already logged within interval')
-                        led.value(0)
-                        return False
+            if len(config.split('_')) == 1:
+                if len(config.split('-')) == 3:
+                    if config.split('-')[2] == color:
+                        if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
+                            print(color + ' already logged within interval')
+                            led.value(0)
+                            return False
+                elif len(config.split('-')) == 4:
+                    if config.split('-')[2] + '-' + config.split('-')[3] == color: 
+                        if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
+                            print(color + ' already logged within interval')
+                            led.value(0)
+                            return False
+            elif len(config.split('_')) == 2:
+                if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
+                            print(color + ' already logged within interval')
+                            led.value(0)
+                            return False
     try:
         with open('config-' + cloudinterval + '-' + color + '.json', 'r') as f:
          tiltAppData = ujson.load(f)
     except:
-        print('couldnt open json settings file')
+        print('couldnt open json settings file for color ' + color)
         led.value(0)
         return False
     excelTimeStamp = convertToExcelTime(int(passedTiltScan.get('timestamp', '0')), int(tiltAppData.get('timezoneoffsetsec', '0')))
@@ -69,19 +77,24 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     actualsgcal = processCalibrationValues(tiltAppData.get('actualSGcal', 'unknown'))
     sg = calibration.calibrate_value(tiltsgcal, actualsgcal, precal_sg)
     if lastLogged.get(color, 0) < 0:
-        comment = 'Tilt%20Pico%20Connected'
+        comment = 'P'
     else:
         comment = ''
-    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
+    if len(color.split('_')) == 2:
+        logColor = color.split('-')[0].split('_')[0] + ':' + color.split('_')[1].upper()
+    else:
+        logColor = color
+    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
     cloudurls = tiltAppData.get('cloudurls', 'unknown').split(',')
+    print(cloudurls)
     led.value(1)
     for cloudurl in cloudurls:
      if cloudurl is not '':
-        print(cloudurl)
         while True:
             try:
-                print("sending...") 
-                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + color.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
+                print("sending...")
+                print(f"Free memory before HTTPS attempt: {gc.mem_free()} bytes")
+                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
                 print(response.status_code)
                 if response.status_code == 200:
                     print(response.text)  # Process the successful response
@@ -290,7 +303,7 @@ def delete_file(filename):
     print(f"Error deleting file '{filename}': {e}")
     return False
 
-async def set_time_from_ntp(retries=3, delay=1):
+async def set_time_from_ntp(retries=10, delay=1):
     attempts = 0
     while attempts < retries:
         try:
@@ -345,7 +358,10 @@ async def handle_request(reader, writer):
         # filter out api request
         if request.url_match('/'):
             led.value(1)
-            await tiltscanner(1100, 'tilts')
+            try: 
+                await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)    
+            except asyncio.TimeoutError:
+                print("tiltscanner timed out")
             tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
             response_builder.set_body_from_dict(tiltScanList)
             tiltScanList.clear() 
@@ -353,15 +369,18 @@ async def handle_request(reader, writer):
         #print (request.query_string)
         elif request.url_match('/sync'):
             led.value(1)
-            await tiltscanner(1100, 'tilts')
+            try: 
+                await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)    
+            except asyncio.TimeoutError:
+                print("tiltscanner timed out")
             tiltDataList = request.query_string.split('&')
             tiltObject = {}
             for data in tiltDataList:
                 tiltObject[data.split('=')[0]] = data.split('=')[1]
-            tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
-            await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject)
-            response_builder.set_body_from_dict(tiltScanList)
             lastLogged[tiltObject.get('color', 'unknown')] = -900
+            await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject)
+            tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
+            response_builder.set_body_from_dict(tiltScanList)
         elif request.url_match('/reset'):
             beacon.startiBeacon(999, 999)
             reset = delete_file('wifi.json')
@@ -440,7 +459,7 @@ async def main():
         print(f"Connecting to {SSID}...")
         wlan.connect(SSID, KEY)  # Connect to the network
         # Wait for connection with timeout
-        timeout = 30  # seconds
+        timeout = 20  # seconds
         for _ in range(timeout * 10):  # Check every 100ms
             if wlan.isconnected():
                 break
@@ -458,15 +477,16 @@ async def main():
         led.value(0)
     elif not wlan.isconnected():
         print("Connection failed, trying again.")
-        timeout = 30  # seconds
+        timeout = 10  # seconds
         for _ in range(timeout * 10):  # Check every 100ms
             if wlan.isconnected():
                 break
             await asyncio.sleep_ms(100)  # Non-blocking delay
-        print("Still not connected, resetting")
-        beacon.startiBeacon(999, 997)
-        time.sleep(5)
-        machine.reset()
+        print("Still not connected, resetting") 
+        beacon.startiBeacon(999, 997) #notify app
+        if delete_file('wifi.json'):
+                await asyncio.sleep(5)
+                machine.reset()
     else:
         machine.reset()
         
@@ -481,19 +501,30 @@ async def main():
     # main task to control automatic logging
     counter = 0
     while True:
-        if counter % 30000 == 0:
-            await tiltscanner(1100, 'tilts')
+        if counter % 10000 == 0:
+            try: 
+                await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)    
+            except asyncio.TimeoutError:
+                print("tiltscanner timed out")
             for tiltScan in tiltScanList:
                 for config_file in os.listdir():
                     if config_file.startswith('config-'):
                         config = config_file[:-5]
                         configMac = await getMac(config)
-                        if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
-                            if tiltScan.get('minor', 'unknown') > 5000:
-                                await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
-                            else:
-                                await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1], config_file.split('-')[1], tiltScan)
-            tiltScanList.clear()
+                        if len(config.split('_')) == 1:
+                            if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
+                                if tiltScan.get('minor', 'unknown') > 5000:
+                                    await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
+                                else:
+                                    await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1], config_file.split('-')[1], tiltScan)
+                        elif len(config.split('_')) == 2:
+                            if config.split('_')[1] == tiltScan.get('mac', 'unknown'):
+                                if tiltScan.get('minor', 'unknown') > 5000:
+                                    await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD' + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan) 
+                                else:
+                                    await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan)
+                tiltScanList.clear()
+                counter = 0
         counter += 1
         # 0 second pause to allow other tasks to run
         await asyncio.sleep(0)
