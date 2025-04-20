@@ -134,6 +134,8 @@ def convertToExcelTime(gmt_time, timeZoneOffsetSec):
         unixFractionOfDay += 10000000
     else:
         excelDayOnly = int(unixTimeStampLocal / 86400 + 25569)
+    if unixFractionOfDay > 9959999:
+            excelDayOnly -= 1
     excelTimeStamp = str(excelDayOnly) + '.' + "{:07d}".format(int(unixFractionOfDay))
     return excelTimeStamp
 
@@ -152,6 +154,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   global KEY_complete
   global SSID
   global KEY
+  global tiltScanList
   SSID_complete = False
   KEY_complete = False
   Part1_complete = False
@@ -233,17 +236,14 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
           RSSI = result.rssi
           TIMESTAMP = time.time()
           tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
+          tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
           if len(tiltScanList) >= 16:
               break
 
-async def create_settings_file(color, data):
+async def create_settings_file(color, data, targetTiltScan):
   global tiltColors
-  global targetTiltScan
   print(data)
-  for tiltScan in tiltScanList:
-    if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] == color.split('-')[0]:
-        targetTiltScan = tiltScan
-        break
+  print(targetTiltScan)
   data['mac'] = targetTiltScan.get('mac', 'unknown')
   if targetTiltScan.get('minor', 0) > 5000:
       data['sg'] = targetTiltScan.get('minor', 1000) / 10000
@@ -362,25 +362,41 @@ async def handle_request(reader, writer):
                 await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)    
             except asyncio.TimeoutError:
                 print("tiltscanner timed out")
-            tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
             response_builder.set_body_from_dict(tiltScanList)
             tiltScanList.clear() 
         #print(raw_request)
         #print (request.query_string)
         elif request.url_match('/sync'):
             led.value(1)
-            try: 
-                await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)    
-            except asyncio.TimeoutError:
-                print("tiltscanner timed out")
             tiltDataList = request.query_string.split('&')
             tiltObject = {}
             for data in tiltDataList:
                 tiltObject[data.split('=')[0]] = data.split('=')[1]
             lastLogged[tiltObject.get('color', 'unknown')] = -900
-            await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject)
-            tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
-            response_builder.set_body_from_dict(tiltScanList)
+            try: 
+                await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)
+                status = 'success: scan ok'
+            except asyncio.TimeoutError:
+                status = 'fail: scanning timed out'
+            returnedTiltScanList = tiltScanList
+            if status == 'success: scan ok' or len(returnedTiltScanList) > 0:
+              for tiltScan in returnedTiltScanList:
+                if tiltScan.get('minor', 0) < 5000 and len(tiltObject.get('color', 'unknown').split('-')) == 1:
+                    if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] == tiltObject.get('color', 'unknown'):
+                        status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
+                        await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        break
+                    else:
+                        status = 'fail: color ' + tiltObject.get('color', 'unknown') + ' not found in scan'
+                elif tiltScan.get('minor', 0) >= 5000 and len(tiltObject.get('color', 'unknown').split('-')) == 2:
+                    print('found HD Tilt')
+                    if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD' == tiltObject.get('color', 'unknown'):
+                        status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
+                        await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        break
+                    else:
+                        status = 'fail: color ' + tiltObject.get('color', 'unknown') + ' not found in scan'
+            response_builder.set_body_from_dict({ 'status' : status})
         elif request.url_match('/reset'):
             beacon.startiBeacon(999, 999)
             reset = delete_file('wifi.json')
