@@ -245,6 +245,9 @@ async def create_settings_file(color, data, targetTiltScan):
   print(data)
   print(targetTiltScan)
   data['mac'] = targetTiltScan.get('mac', 'unknown')
+  if data['mac'] == 'unknown':
+      if len(color.split('_')) == 2:
+          data['mac'] = color.split('_')[1]
   if targetTiltScan.get('minor', 0) > 5000:
       data['sg'] = targetTiltScan.get('minor', 1000) / 10000
       data['temp'] = targetTiltScan.get('major', 0) / 10
@@ -379,23 +382,34 @@ async def handle_request(reader, writer):
             except asyncio.TimeoutError:
                 status = 'fail: scanning timed out'
             returnedTiltScanList = tiltScanList
+            print([status,len(returnedTiltScanList)])
             if status == 'success: scan ok' or len(returnedTiltScanList) > 0:
               for tiltScan in returnedTiltScanList:
                 if tiltScan.get('minor', 0) < 5000 and len(tiltObject.get('color', 'unknown').split('-')) == 1:
+                    print(tiltScan.get('mac', 'unknown') + ' ' + tiltObject.get('mac', 'unknown'))
                     if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] == tiltObject.get('color', 'unknown'):
                         status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
                         await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
                         break
-                    else:
-                        status = 'fail: color ' + tiltObject.get('color', 'unknown') + ' not found in scan'
-                elif tiltScan.get('minor', 0) >= 5000 and len(tiltObject.get('color', 'unknown').split('-')) == 2:
-                    print('found HD Tilt')
-                    if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD' == tiltObject.get('color', 'unknown'):
+                    elif tiltScan.get('mac', 'unknown') == tiltObject.get('mac', 'unknown'):
                         status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
                         await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
                         break
                     else:
                         status = 'fail: color ' + tiltObject.get('color', 'unknown') + ' not found in scan'
+                        await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                elif tiltScan.get('minor', 0) >= 5000 and len(tiltObject.get('color', 'unknown').split('-')) == 2:
+                    if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD' == tiltObject.get('color', 'unknown'):
+                        status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
+                        await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        break
+                    elif tiltScan.get('mac', 'unknown') == tiltObject.get('mac', 'unknown'):
+                        status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
+                        await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        break
+                    else:
+                        status = 'fail: color ' + tiltObject.get('color', 'unknown') + ' not found in scan'
+                        await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
             response_builder.set_body_from_dict({ 'status' : status})
         elif request.url_match('/reset'):
             beacon.startiBeacon(999, 999)
@@ -517,17 +531,19 @@ async def main():
     # main task to control automatic logging
     counter = 0
     while True:
-        if counter % 10000 == 0:
+        if counter % 30000 == 0:
             try: 
                 await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)    
             except asyncio.TimeoutError:
                 print("tiltscanner timed out")
-            for tiltScan in tiltScanList:
+            savedTiltScanList = tiltScanList[:]
+            for tiltScan in savedTiltScanList:
                 for config_file in os.listdir():
                     if config_file.startswith('config-'):
                         config = config_file[:-5]
                         configMac = await getMac(config)
                         if len(config.split('_')) == 1:
+                            print([config.split('-')[2] + configMac, tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown')])
                             if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
                                 if tiltScan.get('minor', 'unknown') > 5000:
                                     await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
