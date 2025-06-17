@@ -2,6 +2,8 @@ from RequestParser import RequestParser
 from ResponseBuilder import ResponseBuilder
 import calibration
 import beacon
+import decrypt
+from PacketReassembler import PacketReassembler
 import network, socket, time
 import ntptime
 import urequests as requests
@@ -98,10 +100,13 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
                 print(response.status_code)
                 if response.status_code == 200:
                     print(response.text)  # Process the successful response
-                elif response.status_code == 400:
-                    print("Bad Request")
+                    if 'success' in response.text.lower() or 'ok' in response.text.lower():
+                        lastLogged[color + ' ' + cloudurl + ' result'] = 'success'
+                    else:
+                        lastLogged[color + ' ' + cloudurl + ' result'] = 'could not confirm SUCCESS or OK in response'
                 else:
                     print(f"Error: HTTP {response.status_code}")  # Handle other errors
+                    lastLogged[color + ' ' + cloudurl + ' result'] = 'error code: ' + response.status_code
             except OSError as e:
                 print(f"Error: Network issue or other error: {e}")
                 asyncio.sleep(5)
@@ -159,6 +164,8 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   KEY_complete = False
   Part1_complete = False
   Part2_complete = False
+  reassembler_1 = PacketReassembler()
+  reassembled_bytes_1 = None
   async with aioble.scan(SCANLENGTH, interval_us=500*1000, window_us=500*1000, active=False) as scanner:
     async for result in scanner:
      if SCANFOR == 'wifi_config':
@@ -167,6 +174,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
          major = int(binascii.hexlify(result.adv_data[22:24]), 16)
          minor = int(binascii.hexlify(result.adv_data[24:26]), 16)
          hex_str = binascii.hexlify(result.adv_data[10:22]).decode('utf-8')
+         hex_bytes = binascii.hexlify(result.adv_data[10:22])
          if binascii.hexlify(result.adv_data[6:10]) == b'a495bc00' and not SSID_complete:
           if minor == 1 and major == 1:
            SSID = bytes.fromhex(hex_str).decode('utf-8')
@@ -196,36 +204,17 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
            Part1_complete = False
            Part2_complete = False
          if binascii.hexlify(result.adv_data[6:10]) == b'a495bc01' and not KEY_complete:
-          if minor == 1 and major == 1:
-           KEY = bytes.fromhex(hex_str).decode('utf-8')
-           print(KEY)
-           KEY_complete = True
-          elif minor == 1 and major == 2 and not Part1_complete:
-           Part1_complete = True
-           KEY = KEY.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
-           print(KEY)
-          elif minor == 2 and major == 2:
-           KEY = KEY + bytes.fromhex(hex_str).decode('utf-8')
-           print(KEY)
-           KEY_complete = True
-          elif minor == 1 and major == 3 and not Part1_complete:
-           Part1_complete = True
-           KEY = KEY.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
-           print(KEY)
-          elif minor == 2 and major == 3 and not Part2_complete:
-           Part2_complete = True
-           KEY = KEY.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
-           print(KEY)
-          elif minor == 3 and major == 3:
-           KEY = KEY.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
-           print(KEY)
-           KEY_complete = True
+            reassembled_bytes_1 = reassembler_1.add_packet(hex_bytes, minor, major)
+            if reassembled_bytes_1 is not None:
+              KEY = bytes.fromhex(reassembled_bytes_1).decode('utf-8')
+              print(KEY)
+              KEY_complete = True
          if SSID_complete and KEY_complete:
-          SSID = SSID.replace('\u0000', '')
-          KEY = KEY.replace('\u0000', '')
-          saveWiFi(SSID, KEY)
-          led_flash_interval = [4, False]
-          break
+            SSID = SSID.replace('\u0000', '')
+            KEY = KEY.replace('\u0000', '')
+            saveWiFi(SSID, KEY)
+            led_flash_interval = [4, False]
+            break
      if SCANFOR == 'tilts':
       if binascii.hexlify(result.adv_data[9:12]) == b'a495bb' and binascii.hexlify(result.adv_data[13:25]) == b'c5b14b44b5121370f02d74de':
           UUID = str(binascii.hexlify(result.adv_data[9:25]).decode())
@@ -323,6 +312,7 @@ async def set_time_from_ntp(retries=10, delay=1):
                 time.sleep(delay)  # Wait before retrying
             else:
                 print("NTP synchronization failed after multiple retries.")
+                return False
             continue # Continue to the next attempt.
     return False  # All attempts failed
 
@@ -374,7 +364,13 @@ async def handle_request(reader, writer):
             tiltDataList = request.query_string.split('&')
             tiltObject = {}
             for data in tiltDataList:
-                tiltObject[data.split('=')[0]] = data.split('=')[1]
+                if len(data.split('=')) > 2:
+                    dataKey = data.split('=')[0]
+                    newData = data.replace(dataKey + '=','')
+                    print(newData)
+                    tiltObject[dataKey] = newData
+                else:
+                       tiltObject[data.split('=')[0]] = data.split('=')[1]
             lastLogged[tiltObject.get('color', 'unknown')] = -900
             try: 
                 await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)
@@ -414,7 +410,8 @@ async def handle_request(reader, writer):
         elif request.url_match('/reset'):
             beacon.startiBeacon(999, 999)
             reset = delete_file('wifi.json')
-
+        elif request.url_match('/lastlogged'):
+            response_builder.set_body_from_dict(lastLogged)
         # try to serve static file
         #response_builder.serve_static_file(request.url, "/api_index.html")
 
@@ -487,6 +484,8 @@ async def main():
     wlan.active(True)
     if not wlan.isconnected():
         print(f"Connecting to {SSID}...")
+        KEY = decrypt.decrypt_aes_cbc(KEY)
+        print(KEY)
         wlan.connect(SSID, KEY)  # Connect to the network
         # Wait for connection with timeout
         timeout = 20  # seconds
@@ -495,17 +494,19 @@ async def main():
                 break
             await asyncio.sleep_ms(100)  # Non-blocking delay
     if wlan.isconnected():
+        beacon.stopiBeacon()
         print(f"Connected to {SSID}, syncing time with NTP")
         if not await set_time_from_ntp():
             beacon.startiBeacon(999, 998) # can't connect to NTP error beacon
             time.sleep(5)
-            machine.reset()
+            machine.soft_reset()
         print("Connected to Wi-Fi")
         print(f"IP address: {wlan.ifconfig()}")  # Print the IP address
         ipAddr = ip_to_uint16(wlan.ifconfig()[0])
         beacon.startiBeacon(ipAddr[0], ipAddr[1])
         led.value(0)
     elif not wlan.isconnected():
+        beacon.stopiBeacon()
         print("Connection failed, trying again.")
         timeout = 10  # seconds
         for _ in range(timeout * 10):  # Check every 100ms
@@ -543,7 +544,7 @@ async def main():
                         config = config_file[:-5]
                         configMac = await getMac(config)
                         if len(config.split('_')) == 1:
-                            print([config.split('-')[2] + configMac, tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown')])
+                            #print([config.split('-')[2] + configMac, tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown')])
                             if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
                                 if tiltScan.get('minor', 'unknown') > 5000:
                                     await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
