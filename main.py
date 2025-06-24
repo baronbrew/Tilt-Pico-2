@@ -43,7 +43,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
             if len(config.split('_')) == 1:
                 if len(config.split('-')) == 3:
                     if config.split('-')[2] == color:
-                        if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
+                        if lastLogged.get(color, -900) + int(config.split('-')[1]) * 60 >= time.time():
                             print(color + ' already logged within interval')
                             led.value(0)
                             return False
@@ -89,6 +89,11 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
     cloudurls = tiltAppData.get('cloudurls', 'unknown').split(',')
     print(cloudurls)
+    if cloudurls == ['', '', '']:
+        lastLogged[color + ' logging'] = False
+        return
+    else:
+        lastLogged[color + ' logging'] = True
     led.value(1)
     for cloudurl in cloudurls:
      if cloudurl is not '':
@@ -96,21 +101,21 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
             try:
                 print("sending...")
                 print(f"Free memory before HTTPS attempt: {gc.mem_free()} bytes")
-                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
+                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment, timeout=30)
                 print(response.status_code)
                 if response.status_code == 200:
                     print(response.text)  # Process the successful response
                     if 'success' in response.text.lower() or 'ok' in response.text.lower():
-                        lastLogged[color + ' ' + cloudurl + ' result'] = 'success'
+                        lastLogged[color + ' ' + cloudurl + ' result'] = 'success ' + str(time.time())
                     else:
-                        lastLogged[color + ' ' + cloudurl + ' result'] = 'could not confirm SUCCESS or OK in response'
+                        lastLogged[color + ' ' + cloudurl + ' result'] = 'success_not_in_resp ' + str(time.time())
                 else:
                     print(f"Error: HTTP {response.status_code}")  # Handle other errors
-                    lastLogged[color + ' ' + cloudurl + ' result'] = 'error code: ' + response.status_code
+                    lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + response.status_code + ' ' + str(time.time())
             except OSError as e:
                 print(f"Error: Network issue or other error: {e}")
-                asyncio.sleep(5)
-                machine.soft_reset()
+                lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + e + ' ' + str(time.time())
+                machine.soft_reset
             finally:
                 if 'response' in locals(): # check to see if response was defined. Prevents an error if the request failed before response was assigned.
                     response.close()  # Important: Close the response to free up resources
@@ -372,6 +377,7 @@ async def handle_request(reader, writer):
                 else:
                        tiltObject[data.split('=')[0]] = data.split('=')[1]
             lastLogged[tiltObject.get('color', 'unknown')] = -900
+            print(lastLogged)
             try: 
                 await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)
                 status = 'success: scan ok'
@@ -412,6 +418,14 @@ async def handle_request(reader, writer):
             reset = delete_file('wifi.json')
         elif request.url_match('/lastlogged'):
             response_builder.set_body_from_dict(lastLogged)
+        elif request.url_match('/remove_config_file'):
+            tiltColorRequested = request.query_string.split('=')[1]
+            for config_file in os.listdir():
+                if config_file.startswith('config-'):
+                    if config_file[10:-5] == tiltColorRequested:
+                        delete_file(config_file)
+                        response_builder.set_body_from_dict({ 'result' : 'Success: ' + config_file + ' removed'})
+                        lastLogged[tiltColorRequested + ' logging'] = False
         # try to serve static file
         #response_builder.serve_static_file(request.url, "/api_index.html")
 
