@@ -32,6 +32,9 @@ KEY_complete = False
 SSID = ''
 KEY = ''
 tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'PINK' ]
+ENOMEM_RETRY_THRESHOLD = 3
+consecutive_enomem_errors = 0
+checkLoggingCounter = 0
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
@@ -43,20 +46,23 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
             if len(config.split('_')) == 1:
                 if len(config.split('-')) == 3:
                     if config.split('-')[2] == color:
-                        if lastLogged.get(color, -900) + int(config.split('-')[1]) * 60 >= time.time():
+                        if lastLogged.get(color, -900) + (int(config.split('-')[1]) - 0) * 60 >= time.time():
                             print(color + ' already logged within interval')
                             led.value(0)
+                            gc.collect()
                             return False
                 elif len(config.split('-')) == 4:
                     if config.split('-')[2] + '-' + config.split('-')[3] == color: 
-                        if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
+                        if lastLogged.get(color, 0) + (int(config.split('-')[1]) - 0) * 60 >= time.time():
                             print(color + ' already logged within interval')
                             led.value(0)
+                            gc.collect()
                             return False
             elif len(config.split('_')) == 2:
-                if lastLogged.get(color, 0) + int(config.split('-')[1]) * 60 >= time.time():
+                if lastLogged.get(color, 0) + (int(config.split('-')[1]) - 0) * 60 >= time.time():
                             print(color + ' already logged within interval')
                             led.value(0)
+                            gc.collect()
                             return False
     try:
         with open('config-' + cloudinterval + '-' + color + '.json', 'r') as f:
@@ -101,7 +107,8 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
             try:
                 print("sending...")
                 print(f"Free memory before HTTPS attempt: {gc.mem_free()} bytes")
-                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment, timeout=30)
+                loggingCheckCounter = 0
+                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment, timeout = 30)
                 print(response.status_code)
                 if response.status_code == 200:
                     print(response.text)  # Process the successful response
@@ -112,14 +119,26 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
                 else:
                     print(f"Error: HTTP {response.status_code}")  # Handle other errors
                     lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + response.status_code + ' ' + str(time.time())
+                    await asyncio.sleep(5)
             except OSError as e:
                 print(f"Error: Network issue or other error: {e}")
                 lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + e + ' ' + str(time.time())
-                machine.soft_reset
+                if e.args[0] == 12:
+                    consecutive_enomem_errors +=1
+                    gc.collect()
+                    if consecutive_enomem_errors >= ENOMEM_RETRY_THRESHOLD:
+                        await asyncio.sleep(2)
+                        machine.soft_reset()
+                else:
+                    consecutive_enomem_errors = 0
+            except Exception as e:
+                consecutive_enomem_errors = 0
+                        
             finally:
-                if 'response' in locals(): # check to see if response was defined. Prevents an error if the request failed before response was assigned.
+                if 'response' in locals() and response is not None: # check to see if response was defined. Prevents an error if the request failed before response was assigned.
                     response.close()  # Important: Close the response to free up resources
                 lastLogged[color] = time.time()
+                gc.collect()
                 print(lastLogged)
                 break
     led.value(0)
@@ -236,8 +255,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
 
 async def create_settings_file(color, data, targetTiltScan):
   global tiltColors
-  print(data)
-  print(targetTiltScan)
+  print(color, data['color'], targetTiltScan['uuid'])
   data['mac'] = targetTiltScan.get('mac', 'unknown')
   if data['mac'] == 'unknown':
       if len(color.split('_')) == 2:
@@ -245,11 +263,9 @@ async def create_settings_file(color, data, targetTiltScan):
   if targetTiltScan.get('minor', 0) > 5000:
       data['sg'] = targetTiltScan.get('minor', 1000) / 10000
       data['temp'] = targetTiltScan.get('major', 0) / 10
-      data['color'] = tiltColors[int(targetTiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD'
   else:
       data['sg'] = targetTiltScan.get('minor', 1000) / 1000
       data['temp'] = targetTiltScan.get('major', 0)
-      data['color'] = tiltColors[int(targetTiltScan.get('uuid', 'a495bb1')[6]) - 1]
   for config_file in os.listdir():
         if config_file.startswith('config-'):
             config = config_file[:-5]
@@ -260,9 +276,9 @@ async def create_settings_file(color, data, targetTiltScan):
                 if config.split('-')[2] + '-' + config.split('-')[3] == color:
                     delete_file(config_file)
   try:
-    with open('config-' + data['cloudinterval'] + '-' + color + '.json', 'w') as f:
+    with open('config-' + data['cloudinterval'] + '-' + data['color'] + '.json', 'w') as f:
       f.write(ujson.dumps(data))
-    print(f"File '{color}' created successfully.")
+    print(f'File "{data['color']}" created successfully.')
   except OSError as e:
     print(f"Error creating file: {e}")
   
@@ -362,24 +378,24 @@ async def handle_request(reader, writer):
                 print("tiltscanner timed out")
             response_builder.set_body_from_dict(tiltScanList)
             tiltScanList.clear() 
-        #print(raw_request)
-        #print (request.query_string)
+            #print(raw_request)
         elif request.url_match('/sync'):
             led.value(1)
             tiltDataList = request.query_string.split('&')
+            print (tiltDataList)
             tiltObject = {}
             for data in tiltDataList:
                 if len(data.split('=')) > 2:
                     dataKey = data.split('=')[0]
                     newData = data.replace(dataKey + '=','')
-                    print(newData)
                     tiltObject[dataKey] = newData
+                    #print(tiltObject) #for brewfather url with = sign
                 else:
                        tiltObject[data.split('=')[0]] = data.split('=')[1]
             lastLogged[tiltObject.get('color', 'unknown')] = -900
             print(lastLogged)
             try: 
-                await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)
+                await asyncio.wait_for(tiltscanner(3030, 'tilts'), timeout=10)
                 status = 'success: scan ok'
             except asyncio.TimeoutError:
                 status = 'fail: scanning timed out'
@@ -392,26 +408,30 @@ async def handle_request(reader, writer):
                     if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] == tiltObject.get('color', 'unknown'):
                         status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
                         await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        checkLoggingCounter = 5
                         break
                     elif tiltScan.get('mac', 'unknown') == tiltObject.get('mac', 'unknown'):
                         status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
                         await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        checkLoggingCounter = 5
                         break
                     else:
                         status = 'fail: color ' + tiltObject.get('color', 'unknown') + ' not found in scan'
-                        await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        #client should try scanning again
                 elif tiltScan.get('minor', 0) >= 5000 and len(tiltObject.get('color', 'unknown').split('-')) == 2:
                     if tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD' == tiltObject.get('color', 'unknown'):
                         status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
                         await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        checkLoggingCounter = 5
                         break
                     elif tiltScan.get('mac', 'unknown') == tiltObject.get('mac', 'unknown'):
                         status = 'success: found target color ' + tiltObject.get('color', 'unknown') + ' in scan'
                         await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        checkLoggingCounter = 5
                         break
                     else:
                         status = 'fail: color ' + tiltObject.get('color', 'unknown') + ' not found in scan'
-                        await create_settings_file(tiltObject.get('color', 'unknown'), tiltObject, tiltScan)
+                        #client should try scanning again
             response_builder.set_body_from_dict({ 'status' : status})
         elif request.url_match('/reset'):
             beacon.startiBeacon(999, 999)
@@ -544,11 +564,10 @@ async def main():
     asyncio.create_task(reset_button_reader())
 
     # main task to control automatic logging
-    counter = 0
     while True:
-        if counter % 30000 == 0:
+        if checkLoggingCounter % 5 == 0:
             try: 
-                await asyncio.wait_for(tiltscanner(1010, 'tilts'), timeout=2)    
+                await asyncio.wait_for(tiltscanner(3030, 'tilts'), timeout=5)    
             except asyncio.TimeoutError:
                 print("tiltscanner timed out")
             savedTiltScanList = tiltScanList[:]
@@ -561,20 +580,24 @@ async def main():
                             #print([config.split('-')[2] + configMac, tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown')])
                             if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
                                 if tiltScan.get('minor', 'unknown') > 5000:
+                                    print(f"Free memory before check logging: {gc.mem_free()} bytes")
                                     await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
                                 else:
+                                    print(f"Free memory before check logging: {gc.mem_free()} bytes")
                                     await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1], config_file.split('-')[1], tiltScan)
                         elif len(config.split('_')) == 2:
                             if config.split('_')[1] == tiltScan.get('mac', 'unknown'):
                                 if tiltScan.get('minor', 'unknown') > 5000:
+                                    print(f"Free memory before check logging: {gc.mem_free()} bytes")
                                     await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD' + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan) 
                                 else:
+                                    print(f"Free memory before check logging: {gc.mem_free()} bytes")
                                     await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan)
                 tiltScanList.clear()
                 counter = 0
         counter += 1
         # 0 second pause to allow other tasks to run
-        await asyncio.sleep(0)
+        await asyncio.sleep(2)
         led.value(0)
 
 
