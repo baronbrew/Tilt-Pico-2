@@ -19,6 +19,7 @@ import sys
 import binascii
 import ujson
 import os
+import rp2
 import gc
 from machine import Pin
 led = Pin("LED", Pin.OUT)
@@ -29,6 +30,7 @@ targetTiltScan = {}
 lastLogged = {}
 SSID_complete = False
 KEY_complete = False
+wifi_config_scans = 0
 SSID = ''
 KEY = ''
 tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'PINK' ]
@@ -184,16 +186,37 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   global SSID
   global KEY
   global tiltScanList
+  global wifi_config_scans
   SSID_complete = False
   KEY_complete = False
   Part1_complete = False
   Part2_complete = False
   reassembler_1 = PacketReassembler()
   reassembled_bytes_1 = None
-  async with aioble.scan(SCANLENGTH, interval_us=500*1000, window_us=500*1000, active=False) as scanner:
+  if len(tiltScanList) > 0:
+          if time.time() - tiltScanList[0].get('timestamp', time.time()) < 6:
+              return False
+          else:
+              tiltScanList.clear()
+  async with aioble.scan(SCANLENGTH, interval_us=1000*1000, window_us=1000*1000, active=False) as scanner:
     async for result in scanner:
      if SCANFOR == 'wifi_config':
-        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -70:
+        if wifi_config_scans > 10000:
+            wifi_config_scans = 1
+            try:
+                with open('wifi-backup.json', 'r') as f:
+                    data = ujson.load(f)
+                    SSID = data["SSID"]
+                    KEY = data["KEY"]
+                    SSID_complete = True
+                    KEY_complete = True
+                    led_flash_interval = [4, False]
+                    break
+            except:
+                print('no WiFi backup file available, will continue to wait for app')
+        wifi_config_scans += 1
+        await asyncio.sleep_ms(10)
+        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -80:
          led_flash_interval = [1, True]
          major = int(binascii.hexlify(result.adv_data[22:24]), 16)
          minor = int(binascii.hexlify(result.adv_data[24:26]), 16)
@@ -239,19 +262,22 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
             saveWiFi(SSID, KEY)
             led_flash_interval = [4, False]
             break
-     if SCANFOR == 'tilts':
-      if binascii.hexlify(result.adv_data[9:12]) == b'a495bb' and binascii.hexlify(result.adv_data[13:25]) == b'c5b14b44b5121370f02d74de':
-          UUID = str(binascii.hexlify(result.adv_data[9:25]).decode())
-          MAC = str(binascii.hexlify(result.device.addr).decode())
-          MAJOR = int(binascii.hexlify(result.adv_data[25:27]), 16)
-          MINOR = int(binascii.hexlify(result.adv_data[27:29]), 16)
-          TX_POWER = str(int(binascii.hexlify(result.adv_data[29:31]), 16))
-          RSSI = result.rssi
-          TIMESTAMP = time.time()
-          tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
-          tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
-          if len(tiltScanList) >= 16:
-              break
+     elif SCANFOR == 'tilts':
+        if binascii.hexlify(result.adv_data[9:12]) == b'a495bb' and binascii.hexlify(result.adv_data[13:25]) == b'c5b14b44b5121370f02d74de' or binascii.hexlify(result.adv_data[6:9]) == b'a495bb' and binascii.hexlify(result.adv_data[10:22]) == b'c5b14b44b5121370f02d74de':
+              offSet = 0
+              if binascii.hexlify(result.adv_data[6:9]) == b'a495bb':
+                offSet = -3
+              UUID = str(binascii.hexlify(result.adv_data[9 + offSet : 25 + offSet]).decode())
+              MAC = str(binascii.hexlify(result.device.addr).decode())
+              MAJOR = int(binascii.hexlify(result.adv_data[ 25 + offSet : 27 + offSet ]), 16)
+              MINOR = int(binascii.hexlify(result.adv_data[ 27 + offSet : 29 + offSet ]), 16)
+              TX_POWER = str(int(binascii.hexlify(result.adv_data[ 29 + offSet : 31 + offSet ]), 16))
+              RSSI = result.rssi
+              TIMESTAMP = time.time()
+              tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
+              tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
+              if len(tiltScanList) >= 16:
+                  break
 
 async def create_settings_file(color, data, targetTiltScan):
   global tiltColors
@@ -302,9 +328,10 @@ def ip_to_uint16(ip_address):
 async def reset_button_reader():
     while True:
         if rp2.bootsel_button() == 1:
-            if delete_file('wifi.json'):
-                await asyncio.sleep(2)
-                machine.reset()
+            delete_file('wifi.json')
+            delete_file('wifi-backup.json')
+            await asyncio.sleep(2)
+            machine.reset()
         await asyncio.sleep_ms(10)
 
 def delete_file(filename):
@@ -317,6 +344,7 @@ def delete_file(filename):
     return False
 
 async def set_time_from_ntp(retries=10, delay=1):
+    global tiltScanList
     attempts = 0
     while attempts < retries:
         try:
@@ -324,6 +352,7 @@ async def set_time_from_ntp(retries=10, delay=1):
             ntptime.settime()
             print(time.time())
             print(time.localtime())
+            tiltScanList = [{ 'timestamp' : time.time() }]
             return True  # Success!
 
         except OSError as e:
@@ -377,7 +406,6 @@ async def handle_request(reader, writer):
             except asyncio.TimeoutError:
                 print("tiltscanner timed out")
             response_builder.set_body_from_dict(tiltScanList)
-            tiltScanList.clear() 
             #print(raw_request)
         elif request.url_match('/sync'):
             led.value(1)
@@ -395,13 +423,13 @@ async def handle_request(reader, writer):
             lastLogged[tiltObject.get('color', 'unknown')] = -900
             print(lastLogged)
             try: 
-                await asyncio.wait_for(tiltscanner(3030, 'tilts'), timeout=10)
-                status = 'success: scan ok'
+                await asyncio.wait_for(tiltscanner(3030, 'tilts'), timeout=4)
+                status = 'success: scanning finished'
             except asyncio.TimeoutError:
                 status = 'fail: scanning timed out'
             returnedTiltScanList = tiltScanList
             print([status,len(returnedTiltScanList)])
-            if status == 'success: scan ok' or len(returnedTiltScanList) > 0:
+            if status == 'success: scanning finished' or len(returnedTiltScanList) > 0:
               for tiltScan in returnedTiltScanList:
                 if tiltScan.get('minor', 0) < 5000 and len(tiltObject.get('color', 'unknown').split('-')) == 1:
                     print(tiltScan.get('mac', 'unknown') + ' ' + tiltObject.get('mac', 'unknown'))
@@ -436,6 +464,7 @@ async def handle_request(reader, writer):
         elif request.url_match('/reset'):
             beacon.startiBeacon(999, 999)
             reset = delete_file('wifi.json')
+            reset = delete_file('wifi-backup.json')
         elif request.url_match('/lastlogged'):
             response_builder.set_body_from_dict(lastLogged)
         elif request.url_match('/remove_config_file'):
@@ -446,6 +475,12 @@ async def handle_request(reader, writer):
                         delete_file(config_file)
                         response_builder.set_body_from_dict({ 'result' : 'Success: ' + config_file + ' removed'})
                         lastLogged[tiltColorRequested + ' logging'] = False
+                    elif tiltColorRequested == 'all':
+                        delete_file(config_file)
+                        lastLogged[tiltColorRequested + ' logging'] = False
+            if tiltColorRequested == 'all':
+                response_builder.set_body_from_dict({ 'result' : 'Success: all colors removed'})
+
         # try to serve static file
         #response_builder.serve_static_file(request.url, "/api_index.html")
 
@@ -489,6 +524,22 @@ async def getMac(config_file_prefix):
         return False
     return tiltAppData.get('mac','unknown')
 
+def copy_file(source_path, destination_path):
+    global SSID
+    global KEY
+    try:
+        with open(source_path, 'rb') as source_file:
+            with open(destination_path, 'wb') as destination_file:
+                while True:
+                    chunk = source_file.read(512)  # Read in chunks (e.g., 512 bytes)
+                    if not chunk:
+                        break
+                    destination_file.write(chunk)
+        print(f"File '{source_path}' copied to '{destination_path}' successfully.")
+    except Exception as e:
+        print(f"Error copying file: {e}, will save wifi.json instead")
+        saveWiFi(SSID, KEY)
+
 # main coroutine to boot async tasks
 async def main():
     global led_flash_interval
@@ -498,6 +549,8 @@ async def main():
     global KEY_complete
     global SSID
     global KEY
+    # start updating task
+    asyncio.create_task(reset_button_reader())
     try:
         with open('wifi.json', 'r') as f:
          data = ujson.load(f)
@@ -510,6 +563,7 @@ async def main():
         while not SSID_complete and not KEY_complete:
             print('Waiting for wifi SSID and KEY from app...')
             await tiltscanner(0, 'wifi_config')
+            await asyncio.sleep(1)
     led_flash_interval = [10, False]
     led.value(0)
     beacon.stopiBeacon()
@@ -518,9 +572,9 @@ async def main():
     wlan.active(True)
     if not wlan.isconnected():
         print(f"Connecting to {SSID}...")
-        KEY = decrypt.decrypt_aes_cbc(KEY)
-        print(KEY)
-        wlan.connect(SSID, KEY)  # Connect to the network
+        decryptedKEY = decrypt.decrypt_aes_cbc(KEY)
+        print(decryptedKEY)
+        wlan.connect(SSID, decryptedKEY)  # Connect to the network
         # Wait for connection with timeout
         timeout = 20  # seconds
         for _ in range(timeout * 10):  # Check every 100ms
@@ -536,6 +590,8 @@ async def main():
             machine.soft_reset()
         print("Connected to Wi-Fi")
         print(f"IP address: {wlan.ifconfig()}")  # Print the IP address
+        if SSID_complete and KEY_complete:
+            copy_file('wifi.json', 'wifi-backup.json')
         ipAddr = ip_to_uint16(wlan.ifconfig()[0])
         beacon.startiBeacon(ipAddr[0], ipAddr[1])
         led.value(0)
@@ -550,8 +606,10 @@ async def main():
         print("Still not connected, resetting") 
         beacon.startiBeacon(999, 997) #notify app
         if delete_file('wifi.json'):
-                await asyncio.sleep(5)
-                machine.reset()
+            await asyncio.sleep(5)
+            machine.reset()
+        else:
+            machine.reset()
     else:
         machine.reset()
         
@@ -560,14 +618,11 @@ async def main():
     server = asyncio.start_server(handle_request, "0.0.0.0", 80)
     asyncio.create_task(server)
 
-    # start updating task
-    asyncio.create_task(reset_button_reader())
-
     # main task to control automatic logging
     while True:
         if checkLoggingCounter % 5 == 0:
             try: 
-                await asyncio.wait_for(tiltscanner(3030, 'tilts'), timeout=5)    
+                await asyncio.wait_for(tiltscanner(3030, 'tilts'), timeout=4)    
             except asyncio.TimeoutError:
                 print("tiltscanner timed out")
             savedTiltScanList = tiltScanList[:]
@@ -593,11 +648,10 @@ async def main():
                                 else:
                                     print(f"Free memory before check logging: {gc.mem_free()} bytes")
                                     await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan)
-                tiltScanList.clear()
                 counter = 0
         counter += 1
         # 0 second pause to allow other tasks to run
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
         led.value(0)
 
 
