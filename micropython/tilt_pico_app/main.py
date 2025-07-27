@@ -94,7 +94,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
         logColor = color.split('-')[0].split('_')[0] + ':' + color.split('_')[1].upper()
     else:
         logColor = color
-    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
+    #print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
     cloudurls = tiltAppData.get('cloudurls', 'unknown').split(',')
     print(cloudurls)
     if cloudurls == ['', '', '']:
@@ -103,6 +103,13 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     else:
         lastLogged[color + ' logging'] = True
     led.value(1)
+    if bool(tiltAppData.get('logLocally', '')):
+        time_sec = time.time() - int(tiltAppData.get('timezoneoffsetsec', '0'))
+        time_tuple = time.localtime(time_sec)
+        time_string = f"{time_tuple[0]}-{time_tuple[1]:02}-{time_tuple[2]:02} {time_tuple[3]:02}:{time_tuple[4]:02}"
+        beername = url_decode(tiltAppData.get('beername', 'unknown'))
+        log_to_csv('log.csv', [time_string, excelTimeStamp, str(sg),str(temp),logColor, beername.split(',')[0], comment], 1, ['Timestamp', 'Timepoint', 'SG', 'Temp', 'Color', 'Beer', 'Comment'])
+        lastLogged[color] = time.time()
     for cloudurl in cloudurls:
      if cloudurl is not '':
         while True:
@@ -194,10 +201,8 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   reassembler_1 = PacketReassembler()
   reassembled_bytes_1 = None
   if len(tiltScanList) > 0:
-          if time.time() - tiltScanList[0].get('timestamp', time.time()) < 6:
+          if time.time() - tiltScanList[0].get('timestamp', time.time()) < 5:
               return False
-          else:
-              tiltScanList.clear()
   async with aioble.scan(SCANLENGTH, interval_us=1000*1000, window_us=1000*1000, active=False) as scanner:
     async for result in scanner:
      if SCANFOR == 'wifi_config':
@@ -275,9 +280,9 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
               RSSI = result.rssi
               TIMESTAMP = time.time()
               tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
-              tiltScanList = await sort_objects_by_key_value(tiltScanList, 'rssi')
-              if len(tiltScanList) >= 16:
-                  break
+              tiltScanList = await sort_objects_by_key_value(tiltScanList, 'timestamp')
+              if len(tiltScanList) > 16:
+                  tiltScanList.pop()
 
 async def create_settings_file(color, data, targetTiltScan):
   global tiltColors
@@ -480,6 +485,41 @@ async def handle_request(reader, writer):
                         lastLogged[tiltColorRequested + ' logging'] = False
             if tiltColorRequested == 'all':
                 response_builder.set_body_from_dict({ 'result' : 'Success: all colors removed'})
+        elif request.url_match('/log.csv'):
+            try:
+                file_size = os.stat("log.csv")[6]
+            except OSError:
+                # If file doesn't exist, send a 404 Not Found error
+                writer.write(b'HTTP/1.0 404 Not Found\r\n\r\nFile not found.')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                print("Client disconnected, file not found.")
+                return
+
+            # These headers tell the browser to download the file as 'log.csv'
+            writer.write(b'HTTP/1.0 200 OK\r\n')
+            writer.write(b'Content-Type: text/csv\r\n')
+            writer.write(f'Content-Length: {file_size}\r\n'.encode('utf-8'))
+            writer.write(b'Content-Disposition: attachment; filename="log.csv"\r\n')
+            writer.write(b'\r\n') # An empty line is required to end the headers
+            await writer.drain() # Wait for the headers to be sent
+
+            # --- Stream the raw CSV file ---
+            # This method is memory-efficient and reads the file in small chunks
+            with open("log.csv", "rb") as f:
+                while True:
+                    chunk = f.read(1024) # Read 1KB at a time
+                    if not chunk:
+                        break # End of file
+                    writer.write(chunk)
+                    await writer.drain() # Wait for the chunk to be sent
+            
+            writer.close()
+            await writer.wait_closed()
+            print("Client disconnected, file sent.")
+            led.value(0)
+            return
 
         # try to serve static file
         #response_builder.serve_static_file(request.url, "/api_index.html")
@@ -539,6 +579,84 @@ def copy_file(source_path, destination_path):
     except Exception as e:
         print(f"Error copying file: {e}, will save wifi.json instead")
         saveWiFi(SSID, KEY)
+
+def log_to_csv(filename: str, data: list, max_size_kb: int = 200, header: list = None):
+    max_bytes = max_size_kb * 1024
+    line_to_add = ','.join(map(str, data)) + '\n'
+    line_to_add_bytes = len(line_to_add.encode('utf-8'))
+
+    file_exists = False
+    file_size = 0
+    try:
+        file_size = os.stat(filename)[6]
+        file_exists = True
+    except OSError:
+        pass
+
+    if not file_exists and header:
+        header_line = ','.join(map(str, header)) + '\n'
+        with open(filename, 'w') as f:
+            f.write(header_line)
+        file_size = os.stat(filename)[6]
+
+    if file_size + line_to_add_bytes > max_bytes:
+        temp_filename = filename + '.tmp'
+        bytes_to_trim = (file_size + line_to_add_bytes) - max_bytes
+        bytes_trimmed = 0
+
+        try:
+            with open(filename, 'r') as f_in, open(temp_filename, 'w') as f_out:
+                # --- MODIFICATION START ---
+                # 1. Read the header from the original file.
+                header_line = f_in.readline()
+
+                # 2. Immediately write the header to the new temporary file.
+                f_out.write(header_line)
+
+                # 3. Now, loop through the rest of the lines (the data) to trim them.
+                for data_line in f_in:
+                    if bytes_trimmed < bytes_to_trim:
+                        bytes_trimmed += len(data_line.encode('utf-8'))
+                        continue # Skip this old data line
+                    f_out.write(data_line)
+                # --- MODIFICATION END ---
+            
+            os.remove(filename)
+            os.rename(temp_filename, filename)
+        except OSError as e:
+            print(f"Error during file trimming: {e}")
+            try:
+                os.remove(temp_filename)
+            except OSError:
+                pass
+            return
+
+    try:
+        with open(filename, 'a') as f:
+            f.write(line_to_add)
+    except OSError as e:
+        print(f"Error writing to file: {e}")
+
+def url_decode(s):
+    decoded_chars = []
+    i = 0
+    while i < len(s):
+        char = s[i]
+        if char == '+':
+            decoded_chars.append(' ')
+            i += 1
+        elif char == '%':
+            hex_code = s[i+1:i+3]
+            try:
+                decoded_chars.append(chr(int(hex_code, 16)))
+                i += 3
+            except ValueError:
+                decoded_chars.append('%')
+                i += 1
+        else:
+            decoded_chars.append(char)
+            i += 1
+    return "".join(decoded_chars)
 
 # main coroutine to boot async tasks
 async def main():
@@ -632,7 +750,6 @@ async def main():
                         config = config_file[:-5]
                         configMac = await getMac(config)
                         if len(config.split('_')) == 1:
-                            #print([config.split('-')[2] + configMac, tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown')])
                             if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
                                 if tiltScan.get('minor', 'unknown') > 5000:
                                     print(f"Free memory before check logging: {gc.mem_free()} bytes")
