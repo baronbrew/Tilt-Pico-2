@@ -31,6 +31,7 @@ lastLogged = {}
 SSID_complete = False
 KEY_complete = False
 wifi_config_scans = 0
+wifi_config_controller = 5000
 SSID = ''
 KEY = ''
 tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'PINK' ]
@@ -97,19 +98,21 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     #print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
     cloudurls = tiltAppData.get('cloudurls', 'unknown').split(',')
     print(cloudurls)
-    if cloudurls == ['', '', '']:
+    if cloudurls == ['', '', ''] and not tiltAppData.get('logLocally', 'false') == 'true':
         lastLogged[color + ' logging'] = False
         return
     else:
         lastLogged[color + ' logging'] = True
     led.value(1)
-    if bool(tiltAppData.get('logLocally', '')):
+    if tiltAppData.get('logLocally', '') == 'true':
         time_sec = time.time() - int(tiltAppData.get('timezoneoffsetsec', '0'))
         time_tuple = time.localtime(time_sec)
         time_string = f"{time_tuple[0]}-{time_tuple[1]:02}-{time_tuple[2]:02} {time_tuple[3]:02}:{time_tuple[4]:02}"
         beername = url_decode(tiltAppData.get('beername', 'unknown'))
-        log_to_csv('log.csv', [time_string, excelTimeStamp, str(sg),str(temp),logColor, beername.split(',')[0], comment], 1, ['Timestamp', 'Timepoint', 'SG', 'Temp', 'Color', 'Beer', 'Comment'])
+        log_to_csv('log.csv', [time_string, excelTimeStamp, str(sg),str(temp),logColor, beername.split(',')[0], comment], 200, ['Timestamp', 'Timepoint', 'SG', 'Temp', 'Color', 'Beer', 'Comment'])
         lastLogged[color] = time.time()
+    if SSID == '' and KEY == '':
+        return
     for cloudurl in cloudurls:
      if cloudurl is not '':
         while True:
@@ -194,6 +197,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   global KEY
   global tiltScanList
   global wifi_config_scans
+  global wifi_config_controller
   SSID_complete = False
   KEY_complete = False
   Part1_complete = False
@@ -222,6 +226,9 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
         wifi_config_scans += 1
         await asyncio.sleep_ms(10)
         if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -80:
+         if wifi_config_controller == 5000:
+             wifi_config_controller = 0
+             return
          led_flash_interval = [1, True]
          major = int(binascii.hexlify(result.adv_data[22:24]), 16)
          minor = int(binascii.hexlify(result.adv_data[24:26]), 16)
@@ -415,7 +422,7 @@ async def handle_request(reader, writer):
         elif request.url_match('/sync'):
             led.value(1)
             tiltDataList = request.query_string.split('&')
-            print (tiltDataList)
+            #print (tiltDataList)
             tiltObject = {}
             for data in tiltDataList:
                 if len(data.split('=')) > 2:
@@ -424,7 +431,7 @@ async def handle_request(reader, writer):
                     tiltObject[dataKey] = newData
                     #print(tiltObject) #for brewfather url with = sign
                 else:
-                       tiltObject[data.split('=')[0]] = data.split('=')[1]
+                    tiltObject[data.split('=')[0]] = data.split('=')[1]
             lastLogged[tiltObject.get('color', 'unknown')] = -900
             print(lastLogged)
             try: 
@@ -485,6 +492,15 @@ async def handle_request(reader, writer):
                         lastLogged[tiltColorRequested + ' logging'] = False
             if tiltColorRequested == 'all':
                 response_builder.set_body_from_dict({ 'result' : 'Success: all colors removed'})
+        elif request.url_match('/remove_log_file'):
+            try:
+                os.stat('log.csv')
+                if delete_file('log.csv'):
+                    response_builder.set_body_from_dict({ 'result' : 'Success: log.csv removed'})
+                else:
+                    response_builder.set_body_from_dict({ 'result' : 'Fail: log.csv not removed'})
+            except:
+                response_builder.set_body_from_dict({ 'result' : 'Fail: log.csv not found'})
         elif request.url_match('/log.csv'):
             try:
                 file_size = os.stat("log.csv")[6]
@@ -658,6 +674,40 @@ def url_decode(s):
             i += 1
     return "".join(decoded_chars)
 
+async def loggingController(period = 5, scanlength = 3030):
+    if checkLoggingCounter % 5 == 0:
+        try: 
+            await asyncio.wait_for(tiltscanner(scanlength, 'tilts'), timeout=4)    
+        except asyncio.TimeoutError:
+            print("tiltscanner timed out")
+        savedTiltScanList = tiltScanList[:]
+        for tiltScan in savedTiltScanList:
+            for config_file in os.listdir():
+                if config_file.startswith('config-'):
+                    config = config_file[:-5]
+                    configMac = await getMac(config)
+                    if len(config.split('_')) == 1:
+                        if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
+                            if tiltScan.get('minor', 'unknown') > 5000:
+                                print(f"Free memory before check logging: {gc.mem_free()} bytes")
+                                await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
+                            else:
+                                print(f"Free memory before check logging: {gc.mem_free()} bytes")
+                                await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1], config_file.split('-')[1], tiltScan)
+                    elif len(config.split('_')) == 2:
+                        if config.split('_')[1] == tiltScan.get('mac', 'unknown'):
+                            if tiltScan.get('minor', 'unknown') > 5000:
+                                print(f"Free memory before check logging: {gc.mem_free()} bytes")
+                                await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD' + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan) 
+                            else:
+                                print(f"Free memory before check logging: {gc.mem_free()} bytes")
+                                await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan)
+            counter = 0
+    counter += 1
+    # 0 second pause to allow other tasks to run
+    await asyncio.sleep(period)
+    led.value(0)
+
 # main coroutine to boot async tasks
 async def main():
     global led_flash_interval
@@ -667,6 +717,7 @@ async def main():
     global KEY_complete
     global SSID
     global KEY
+    global wifi_config_controller
     # start updating task
     asyncio.create_task(reset_button_reader())
     try:
@@ -680,8 +731,11 @@ async def main():
         beacon.startiBeacon(999, 999)
         while not SSID_complete and not KEY_complete:
             print('Waiting for wifi SSID and KEY from app...')
-            await tiltscanner(0, 'wifi_config')
-            await asyncio.sleep(1)
+            await tiltscanner(wifi_config_controller, 'wifi_config')
+            if wifi_config_controller is not 0:
+                await loggingController(0, 1010)
+            if wifi_config_controller is not 0:
+                await asyncio.sleep_ms(500)
     led_flash_interval = [10, False]
     led.value(0)
     beacon.stopiBeacon()
@@ -738,38 +792,7 @@ async def main():
 
     # main task to control automatic logging
     while True:
-        if checkLoggingCounter % 5 == 0:
-            try: 
-                await asyncio.wait_for(tiltscanner(3030, 'tilts'), timeout=4)    
-            except asyncio.TimeoutError:
-                print("tiltscanner timed out")
-            savedTiltScanList = tiltScanList[:]
-            for tiltScan in savedTiltScanList:
-                for config_file in os.listdir():
-                    if config_file.startswith('config-'):
-                        config = config_file[:-5]
-                        configMac = await getMac(config)
-                        if len(config.split('_')) == 1:
-                            if config.split('-')[2] + configMac == tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + tiltScan.get('mac', 'unknown'):
-                                if tiltScan.get('minor', 'unknown') > 5000:
-                                    print(f"Free memory before check logging: {gc.mem_free()} bytes")
-                                    await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD', config_file.split('-')[1], tiltScan)
-                                else:
-                                    print(f"Free memory before check logging: {gc.mem_free()} bytes")
-                                    await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1], config_file.split('-')[1], tiltScan)
-                        elif len(config.split('_')) == 2:
-                            if config.split('_')[1] == tiltScan.get('mac', 'unknown'):
-                                if tiltScan.get('minor', 'unknown') > 5000:
-                                    print(f"Free memory before check logging: {gc.mem_free()} bytes")
-                                    await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '-HD' + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan) 
-                                else:
-                                    print(f"Free memory before check logging: {gc.mem_free()} bytes")
-                                    await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan)
-                counter = 0
-        counter += 1
-        # 0 second pause to allow other tasks to run
-        await asyncio.sleep(5)
-        led.value(0)
+       await loggingController()
 
 
 # start asyncio task and loop
