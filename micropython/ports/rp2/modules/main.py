@@ -31,7 +31,7 @@ lastLogged = {}
 SSID_complete = False
 KEY_complete = False
 wifi_config_scans = 0
-wifi_config_controller = 5000
+wifi_config_controller = 60000
 SSID = ''
 KEY = ''
 tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'PINK' ]
@@ -225,10 +225,10 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
                 print('no WiFi backup file available, will continue to wait for app')
         wifi_config_scans += 1
         await asyncio.sleep_ms(10)
-        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -80:
-         if wifi_config_controller == 5000:
+        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -101:
+         if wifi_config_controller == 60000:
              wifi_config_controller = 0
-             return
+             break
          led_flash_interval = [1, True]
          major = int(binascii.hexlify(result.adv_data[22:24]), 16)
          minor = int(binascii.hexlify(result.adv_data[24:26]), 16)
@@ -674,7 +674,7 @@ def url_decode(s):
             i += 1
     return "".join(decoded_chars)
 
-async def loggingController(period = 5, scanlength = 3030):
+async def loggingController(period = 5, scanlength = 3030, counter = 0):
     if checkLoggingCounter % 5 == 0:
         try: 
             await asyncio.wait_for(tiltscanner(scanlength, 'tilts'), timeout=4)    
@@ -733,7 +733,7 @@ async def main():
             print('Waiting for wifi SSID and KEY from app...')
             await tiltscanner(wifi_config_controller, 'wifi_config')
             if wifi_config_controller is not 0:
-                await loggingController(0, 1010)
+                await loggingController(0, 1010, 0)
             if wifi_config_controller is not 0:
                 await asyncio.sleep_ms(500)
     led_flash_interval = [10, False]
