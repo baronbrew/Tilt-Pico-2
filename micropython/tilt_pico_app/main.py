@@ -31,13 +31,12 @@ lastLogged = {}
 SSID_complete = False
 KEY_complete = False
 wifi_config_scans = 0
-wifi_config_controller = 60000
 SSID = ''
 KEY = ''
 tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'PINK' ]
 ENOMEM_RETRY_THRESHOLD = 3
 consecutive_enomem_errors = 0
-checkLoggingCounter = 0
+checkLoggingCounter = 5
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
@@ -197,7 +196,6 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   global KEY
   global tiltScanList
   global wifi_config_scans
-  global wifi_config_controller
   SSID_complete = False
   KEY_complete = False
   Part1_complete = False
@@ -210,8 +208,8 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   async with aioble.scan(SCANLENGTH, interval_us=1000*1000, window_us=1000*1000, active=False) as scanner:
     async for result in scanner:
      if SCANFOR == 'wifi_config':
-        if wifi_config_scans > 10000:
-            wifi_config_scans = 1
+        if wifi_config_scans > 2000:
+            wifi_config_scans = 0
             try:
                 with open('wifi-backup.json', 'r') as f:
                     data = ujson.load(f)
@@ -223,12 +221,11 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
                     break
             except:
                 print('no WiFi backup file available, will continue to wait for app')
+                break
         wifi_config_scans += 1
         await asyncio.sleep_ms(10)
-        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and result.rssi > -101:
-         if wifi_config_controller == 60000:
-             wifi_config_controller = 0
-             break
+        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc':
+         wifi_config_scans = 0
          led_flash_interval = [1, True]
          major = int(binascii.hexlify(result.adv_data[22:24]), 16)
          minor = int(binascii.hexlify(result.adv_data[24:26]), 16)
@@ -674,7 +671,8 @@ def url_decode(s):
             i += 1
     return "".join(decoded_chars)
 
-async def loggingController(period = 5, scanlength = 3030, counter = 0):
+async def loggingController(period = 5, scanlength = 3030):
+    global checkLoggingCounter
     if checkLoggingCounter % 5 == 0:
         try: 
             await asyncio.wait_for(tiltscanner(scanlength, 'tilts'), timeout=4)    
@@ -702,8 +700,8 @@ async def loggingController(period = 5, scanlength = 3030, counter = 0):
                             else:
                                 print(f"Free memory before check logging: {gc.mem_free()} bytes")
                                 await logToCloud(tiltColors[int(tiltScan.get('uuid', 'a495bb1')[6]) - 1] + '_' + tiltScan.get('mac', 'unknown'), config_file.split('-')[1], tiltScan)
-            counter = 0
-    counter += 1
+            checkLoggingCounter = 0
+    checkLoggingCounter += 1
     # 0 second pause to allow other tasks to run
     await asyncio.sleep(period)
     led.value(0)
@@ -717,7 +715,6 @@ async def main():
     global KEY_complete
     global SSID
     global KEY
-    global wifi_config_controller
     # start updating task
     asyncio.create_task(reset_button_reader())
     try:
@@ -731,11 +728,9 @@ async def main():
         beacon.startiBeacon(999, 999)
         while not SSID_complete and not KEY_complete:
             print('Waiting for wifi SSID and KEY from app...')
-            await tiltscanner(wifi_config_controller, 'wifi_config')
-            if wifi_config_controller is not 0:
-                await loggingController(0, 1010, 0)
-            if wifi_config_controller is not 0:
-                await asyncio.sleep_ms(500)
+            await loggingController()
+            await tiltscanner(0, 'wifi_config')
+            await asyncio.sleep_ms(100)
     led_flash_interval = [10, False]
     led.value(0)
     beacon.stopiBeacon()
