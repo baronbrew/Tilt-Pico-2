@@ -36,7 +36,7 @@ KEY = ''
 tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'PINK' ]
 ENOMEM_RETRY_THRESHOLD = 3
 consecutive_enomem_errors = 0
-checkLoggingCounter = 5
+checkLoggingCounter = 4
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
@@ -715,6 +715,7 @@ async def main():
     global KEY_complete
     global SSID
     global KEY
+    global wifi_config_scans
     # start updating task
     asyncio.create_task(reset_button_reader())
     try:
@@ -726,6 +727,7 @@ async def main():
         led_flash_interval = [10, True]
         asyncio.create_task(flash_led())
         beacon.startiBeacon(999, 999)
+        wifi_config_scans = 2000
         while not SSID_complete and not KEY_complete:
             print('Waiting for wifi SSID and KEY from app...')
             await loggingController()
@@ -788,7 +790,6 @@ async def main():
     # main task to control automatic logging
     while True:
        await loggingController()
-
 
 # start asyncio task and loop
 try:
