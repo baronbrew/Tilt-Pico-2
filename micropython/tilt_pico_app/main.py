@@ -224,14 +224,17 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
                 break
         wifi_config_scans += 1
         await asyncio.sleep_ms(10)
-        if binascii.hexlify(result.adv_data[6:9]) == b'a495bc':
+        if binascii.hexlify(result.adv_data[9:12]) == b'a495bc' or binascii.hexlify(result.adv_data[6:9]) == b'a495bc':
          wifi_config_scans = 0
+         offSet = 0
+         if binascii.hexlify(result.adv_data[9:12]) == b'a495bc':
+          offSet = 3
          led_flash_interval = [1, True]
-         major = int(binascii.hexlify(result.adv_data[22:24]), 16)
-         minor = int(binascii.hexlify(result.adv_data[24:26]), 16)
-         hex_str = binascii.hexlify(result.adv_data[10:22]).decode('utf-8')
-         hex_bytes = binascii.hexlify(result.adv_data[10:22])
-         if binascii.hexlify(result.adv_data[6:10]) == b'a495bc00' and not SSID_complete:
+         major = int(binascii.hexlify(result.adv_data[22  + offSet : 24  + offSet]), 16)
+         minor = int(binascii.hexlify(result.adv_data[24  + offSet : 26  + offSet]), 16)
+         hex_str = binascii.hexlify(result.adv_data[10  + offSet : 22  + offSet]).decode('utf-8')
+         hex_bytes = binascii.hexlify(result.adv_data[10  + offSet : 22  + offSet])
+         if binascii.hexlify(result.adv_data[6 + offSet : 10 + offSet]) == b'a495bc00' and not SSID_complete:
           if minor == 1 and major == 1:
            SSID = bytes.fromhex(hex_str).decode('utf-8')
            print(SSID)
@@ -259,7 +262,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
            SSID_complete = True
            Part1_complete = False
            Part2_complete = False
-         if binascii.hexlify(result.adv_data[6:10]) == b'a495bc01' and not KEY_complete:
+         if binascii.hexlify(result.adv_data[6 + offSet : 10 + offSet]) == b'a495bc01' and not KEY_complete:
             reassembled_bytes_1 = reassembler_1.add_packet(hex_bytes, minor, major)
             if reassembled_bytes_1 is not None:
               KEY = bytes.fromhex(reassembled_bytes_1).decode('utf-8')
