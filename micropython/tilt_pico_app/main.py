@@ -268,6 +268,8 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
               KEY = bytes.fromhex(reassembled_bytes_1).decode('utf-8')
               print(KEY)
               KEY_complete = True
+            else:
+              gc.collect()
          if SSID_complete and KEY_complete:
             SSID = SSID.replace('\u0000', '')
             KEY = KEY.replace('\u0000', '')
