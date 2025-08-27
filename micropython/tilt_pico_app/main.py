@@ -205,6 +205,7 @@ def bt_irq(event, data):
 
 
 async def _scan_results_generator(scan_duration_ms):
+    await asyncio.sleep_ms(0)  # Ensure this is treated as an async generator
     global _scan_results, _scan_done_event
     _scan_results.clear()
     _scan_done_event.clear()
