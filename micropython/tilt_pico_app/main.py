@@ -204,9 +204,31 @@ def bt_irq(event, data):
         _scan_done_event.set()
 
 
+async def _scan_results_generator(scan_duration_ms):
+    global _scan_results, _scan_done_event
+    _scan_results.clear()
+    _scan_done_event.clear()
+    ble.irq(bt_irq)
+    ble.gap_scan(scan_duration_ms, 1000000, 1000000, False)
+    try:
+        if scan_duration_ms > 0:
+            await _scan_done_event.wait()
+            for result in _scan_results:
+                yield result
+        else:  # Continuous scan
+            processed_index = 0
+            while True:
+                while processed_index < len(_scan_results):
+                    yield _scan_results[processed_index]
+                    processed_index += 1
+                await asyncio.sleep_ms(50)
+    finally:
+        ble.gap_scan(None)
+        ble.irq(None)
+
+
 async def tiltscanner(SCANLENGTH, SCANFOR):
     global led_flash_interval, SSID_complete, KEY_complete, SSID, KEY, tiltScanList, wifi_config_scans
-    global _scan_results, _scan_done_event
     SSID_complete = False
     KEY_complete = False
     Part1_complete = False
@@ -216,13 +238,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
     if len(tiltScanList) > 0:
         if time.time() - tiltScanList[0].get('timestamp', time.time()) < 5:
             return False
-    _scan_results.clear()
-    _scan_done_event.clear()
-    ble.irq(bt_irq)
-    ble.gap_scan(SCANLENGTH, 1000000, 1000000, False)
-    await _scan_done_event.wait()
-    ble.irq(None)
-    for result in _scan_results:
+    async for result in _scan_results_generator(SCANLENGTH):
         adv_data = result['adv_data']
         addr = result['addr']
         rssi = result['rssi']
