@@ -203,95 +203,97 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   reassembler_1 = PacketReassembler()
   reassembled_bytes_1 = None
   if len(tiltScanList) > 0:
-          if time.time() - tiltScanList[0].get('timestamp', time.time()) < 5:
-              return False
+      if time.time() - tiltScanList[0].get('timestamp', time.time()) < 5:
+          return False
+      tiltScanList.pop()
   async with aioble.scan(SCANLENGTH, interval_us=1000*1000, window_us=1000*1000, active=False) as scanner:
     async for result in scanner:
-     if SCANFOR == 'wifi_config':
-        if wifi_config_scans > 2000:
-            wifi_config_scans = 0
-            try:
-                with open('wifi-backup.json', 'r') as f:
-                    data = ujson.load(f)
-                    SSID = data["SSID"]
-                    KEY = data["KEY"]
-                    SSID_complete = True
-                    KEY_complete = True
+        if binascii.hexlify(result.adv_data[9:11]) == b'a495' or binascii.hexlify(result.adv_data[6:8]) == b'a495':
+            if SCANFOR == 'wifi_config':
+                if wifi_config_scans > 2000:
+                    wifi_config_scans = 0
+                    try:
+                        with open('wifi-backup.json', 'r') as f:
+                            data = ujson.load(f)
+                            SSID = data["SSID"]
+                            KEY = data["KEY"]
+                            SSID_complete = True
+                            KEY_complete = True
+                            led_flash_interval = [4, False]
+                            break
+                    except:
+                        print('no WiFi backup file available, will continue to wait for app')
+                        break
+                wifi_config_scans += 1
+                print(wifi_config_scans)
+                if binascii.hexlify(result.adv_data[9:12]) == b'a495bc' or binascii.hexlify(result.adv_data[6:9]) == b'a495bc':
+                 wifi_config_scans = 0
+                 offSet = 0
+                 if binascii.hexlify(result.adv_data[9:12]) == b'a495bc':
+                  offSet = 3
+                 led_flash_interval = [1, True]
+                 major = int(binascii.hexlify(result.adv_data[22  + offSet : 24  + offSet]), 16)
+                 minor = int(binascii.hexlify(result.adv_data[24  + offSet : 26  + offSet]), 16)
+                 hex_str = binascii.hexlify(result.adv_data[10  + offSet : 22  + offSet]).decode('utf-8')
+                 hex_bytes = binascii.hexlify(result.adv_data[10  + offSet : 22  + offSet])
+                 if binascii.hexlify(result.adv_data[6 + offSet : 10 + offSet]) == b'a495bc00' and not SSID_complete:
+                  if minor == 1 and major == 1:
+                   SSID = bytes.fromhex(hex_str).decode('utf-8')
+                   print(SSID)
+                   SSID_complete = True
+                  elif minor == 1 and major == 2 and not Part1_complete:
+                   Part1_complete = True
+                   SSID = SSID.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
+                   print(SSID)
+                  elif minor == 2 and major == 2:
+                   SSID = SSID + bytes.fromhex(hex_str).decode('utf-8')
+                   print(SSID)
+                   Part1_complete = False
+                   SSID_complete = True
+                  elif minor == 1 and major == 3 and not Part1_complete:
+                   Part1_complete = True
+                   SSID = SSID.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
+                   print(SSID)
+                  elif minor == 2 and major == 3 and not Part2_complete:
+                   Part2_complete = True
+                   SSID = SSID.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
+                   print(SSID)
+                  elif minor == 3 and major == 3:
+                   SSID = SSID.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
+                   print(SSID)
+                   SSID_complete = True
+                   Part1_complete = False
+                   Part2_complete = False
+                 if binascii.hexlify(result.adv_data[6 + offSet : 10 + offSet]) == b'a495bc01' and not KEY_complete:
+                    reassembled_bytes_1 = reassembler_1.add_packet(hex_bytes, minor, major)
+                    if reassembled_bytes_1 is not None:
+                      KEY = bytes.fromhex(reassembled_bytes_1).decode('utf-8')
+                      print(KEY)
+                      KEY_complete = True
+                    else:
+                      gc.collect()
+                 if SSID_complete and KEY_complete:
+                    SSID = SSID.replace('\u0000', '')
+                    KEY = KEY.replace('\u0000', '')
+                    saveWiFi(SSID, KEY)
                     led_flash_interval = [4, False]
                     break
-            except:
-                print('no WiFi backup file available, will continue to wait for app')
-                break
-        wifi_config_scans += 1
-        await asyncio.sleep_ms(10)
-        if binascii.hexlify(result.adv_data[9:12]) == b'a495bc' or binascii.hexlify(result.adv_data[6:9]) == b'a495bc':
-         wifi_config_scans = 0
-         offSet = 0
-         if binascii.hexlify(result.adv_data[9:12]) == b'a495bc':
-          offSet = 3
-         led_flash_interval = [1, True]
-         major = int(binascii.hexlify(result.adv_data[22  + offSet : 24  + offSet]), 16)
-         minor = int(binascii.hexlify(result.adv_data[24  + offSet : 26  + offSet]), 16)
-         hex_str = binascii.hexlify(result.adv_data[10  + offSet : 22  + offSet]).decode('utf-8')
-         hex_bytes = binascii.hexlify(result.adv_data[10  + offSet : 22  + offSet])
-         if binascii.hexlify(result.adv_data[6 + offSet : 10 + offSet]) == b'a495bc00' and not SSID_complete:
-          if minor == 1 and major == 1:
-           SSID = bytes.fromhex(hex_str).decode('utf-8')
-           print(SSID)
-           SSID_complete = True
-          elif minor == 1 and major == 2 and not Part1_complete:
-           Part1_complete = True
-           SSID = SSID.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
-           print(SSID)
-          elif minor == 2 and major == 2:
-           SSID = SSID + bytes.fromhex(hex_str).decode('utf-8')
-           print(SSID)
-           Part1_complete = False
-           SSID_complete = True
-          elif minor == 1 and major == 3 and not Part1_complete:
-           Part1_complete = True
-           SSID = SSID.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
-           print(SSID)
-          elif minor == 2 and major == 3 and not Part2_complete:
-           Part2_complete = True
-           SSID = SSID.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
-           print(SSID)
-          elif minor == 3 and major == 3:
-           SSID = SSID.replace('\u0000', '') + bytes.fromhex(hex_str).decode('utf-8')
-           print(SSID)
-           SSID_complete = True
-           Part1_complete = False
-           Part2_complete = False
-         if binascii.hexlify(result.adv_data[6 + offSet : 10 + offSet]) == b'a495bc01' and not KEY_complete:
-            reassembled_bytes_1 = reassembler_1.add_packet(hex_bytes, minor, major)
-            if reassembled_bytes_1 is not None:
-              KEY = bytes.fromhex(reassembled_bytes_1).decode('utf-8')
-              print(KEY)
-              KEY_complete = True
-            else:
-              gc.collect()
-         if SSID_complete and KEY_complete:
-            SSID = SSID.replace('\u0000', '')
-            KEY = KEY.replace('\u0000', '')
-            saveWiFi(SSID, KEY)
-            led_flash_interval = [4, False]
-            break
-     elif SCANFOR == 'tilts':
-        if binascii.hexlify(result.adv_data[9:12]) == b'a495bb' and binascii.hexlify(result.adv_data[13:25]) == b'c5b14b44b5121370f02d74de' or binascii.hexlify(result.adv_data[6:9]) == b'a495bb' and binascii.hexlify(result.adv_data[10:22]) == b'c5b14b44b5121370f02d74de':
-              offSet = 0
-              if binascii.hexlify(result.adv_data[6:9]) == b'a495bb':
-                offSet = -3
-              UUID = str(binascii.hexlify(result.adv_data[9 + offSet : 25 + offSet]).decode())
-              MAC = str(binascii.hexlify(result.device.addr).decode())
-              MAJOR = int(binascii.hexlify(result.adv_data[ 25 + offSet : 27 + offSet ]), 16)
-              MINOR = int(binascii.hexlify(result.adv_data[ 27 + offSet : 29 + offSet ]), 16)
-              TX_POWER = str(int(binascii.hexlify(result.adv_data[ 29 + offSet : 31 + offSet ]), 16))
-              RSSI = result.rssi
-              TIMESTAMP = time.time()
-              tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
-              tiltScanList = await sort_objects_by_key_value(tiltScanList, 'timestamp')
-              if len(tiltScanList) > 16:
-                  tiltScanList.pop()
+            elif SCANFOR == 'tilts':
+                if binascii.hexlify(result.adv_data[9:12]) == b'a495bb' and binascii.hexlify(result.adv_data[13:25]) == b'c5b14b44b5121370f02d74de' or binascii.hexlify(result.adv_data[6:9]) == b'a495bb' and binascii.hexlify(result.adv_data[10:22]) == b'c5b14b44b5121370f02d74de':
+                      offSet = 0
+                      if binascii.hexlify(result.adv_data[6:9]) == b'a495bb':
+                        offSet = -3
+                      UUID = str(binascii.hexlify(result.adv_data[9 + offSet : 25 + offSet]).decode())
+                      MAC = str(binascii.hexlify(result.device.addr).decode())
+                      MAJOR = int(binascii.hexlify(result.adv_data[ 25 + offSet : 27 + offSet ]), 16)
+                      MINOR = int(binascii.hexlify(result.adv_data[ 27 + offSet : 29 + offSet ]), 16)
+                      TX_POWER = str(int(binascii.hexlify(result.adv_data[ 29 + offSet : 31 + offSet ]), 16))
+                      RSSI = result.rssi
+                      TIMESTAMP = time.time()
+                      tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
+                      tiltScanList = await sort_objects_by_key_value(tiltScanList, 'timestamp')
+                      if len(tiltScanList) > 16:
+                          tiltScanList.pop()
 
 async def create_settings_file(color, data, targetTiltScan):
   global tiltColors
