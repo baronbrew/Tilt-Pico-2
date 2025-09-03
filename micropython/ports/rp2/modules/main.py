@@ -225,8 +225,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
                         print('no WiFi backup file available, will continue to wait for app')
                         break
                 wifi_config_scans += 1
-                print(wifi_config_scans)
-                if binascii.hexlify(result.adv_data[9:12]) == b'a495bc' or binascii.hexlify(result.adv_data[6:9]) == b'a495bc':
+                if binascii.hexlify(result.adv_data[9:12]) == b'a495bc' or binascii.hexlify(result.adv_data[6:9]) == b'a495bc' and not binascii.hexlify(result.adv_data[6:9]) == b'a495bc02':
                  wifi_config_scans = 0
                  offSet = 0
                  if binascii.hexlify(result.adv_data[9:12]) == b'a495bc':
