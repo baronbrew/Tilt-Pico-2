@@ -60,7 +60,7 @@ class ResponseBuilder:
                 self.content_type = "text/css"
             else:
                 # let browser work it out
-                self.content_type = "text/html"
+                self.content_type = "application/json"
             # load content
             file = open(path + "/" + filename)
             self.set_body(file.read())
@@ -85,6 +85,7 @@ class ResponseBuilder:
         # Headers
         self.response += "Server: " + self.server + "\r\n"
         self.response += "Content-Type: " + self.content_type + "\r\n"
+        self.response += "Access-Control-Allow-Origin: *\r\n"
         self.response += "Content-Length: " + str(len(self.body)) + "\r\n"
         self.response += "Connection: Closed\r\n"
         self.response += "\r\n"

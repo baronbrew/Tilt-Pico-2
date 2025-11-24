@@ -37,6 +37,10 @@ tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'P
 ENOMEM_RETRY_THRESHOLD = 3
 consecutive_enomem_errors = 0
 checkLoggingCounter = 4
+checkConnectionCounter = 1
+pico_IP = '0.0.0.0'
+TP_ver = 1005
+pico_MAC = '00:00:00:00:00'
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
@@ -108,7 +112,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
         time_tuple = time.localtime(time_sec)
         time_string = f"{time_tuple[0]}-{time_tuple[1]:02}-{time_tuple[2]:02} {time_tuple[3]:02}:{time_tuple[4]:02}"
         beername = url_decode(tiltAppData.get('beername', 'unknown'))
-        log_to_csv('log.csv', [time_string, excelTimeStamp, str(sg),str(temp),logColor, beername.split(',')[0], comment], 200, ['Timestamp', 'Timepoint', 'SG', 'Temp', 'Color', 'Beer', 'Comment'])
+        log_to_csv('log.csv', [time_string, excelTimeStamp, str(round(sg,4)),str(round(temp,1)),logColor, beername.split(',')[0], comment], 200, ['Timestamp', 'Timepoint', 'SG', 'Temp', 'Color', 'Beer', 'Comment'])
         lastLogged[color] = time.time()
     if SSID == '' and KEY == '':
         return
@@ -404,6 +408,7 @@ async def sort_objects_by_key_value(objects, key):
 async def handle_request(reader, writer):
     global tiltScanList
     global led_flash_interval
+    global TP_ver
     reset = False
     try:
         # allow other tasks to run while waiting for data
@@ -539,10 +544,16 @@ async def handle_request(reader, writer):
             print("Client disconnected, file sent.")
             led.value(0)
             return
-
+        elif request.url_match('/info'):
+            temp_f = get_pico_temperature()
+            config_files = []
+            for config_file in os.listdir():
+                if config_file.startswith('config-'):
+                    config_files.append(config_file)
+            response_builder.set_body_from_dict({'ip_address' : pico_IP, 'tilt_pico_version' : TP_ver,'tilt_pico_temperature_f' : temp_f, 'tilt_pico_mac_address' : pico_MAC, 'tilt_pico_configuration_files' : config_files })
         # try to serve static file
-        #response_builder.serve_static_file(request.url, "/api_index.html")
-
+        else:
+            response_builder.serve_static_file(request.url)
         # build response message
         response_builder.build_response()
         # send reponse back to client
@@ -712,6 +723,20 @@ async def loggingController(period = 5, scanlength = 3030):
     await asyncio.sleep(period)
     led.value(0)
 
+def get_pico_temperature():
+    sensor_temp = machine.ADC(4)
+    conversion_factor = 3.3 / (65535)
+    reading = sensor_temp.read_u16() * conversion_factor
+    temperature_celsius = 27 - (reading - 0.706) / 0.001721
+    temperature_fahrenheit = (temperature_celsius * 1.8) + 32
+    return round(temperature_fahrenheit, 1)
+
+def get_pico_mac_address():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    mac_bytes = wlan.config('mac')
+    mac_hex = bibinascii.hexlify(mac_bytes, ':').decode().upper()
+
 # main coroutine to boot async tasks
 async def main():
     global led_flash_interval
@@ -722,6 +747,9 @@ async def main():
     global SSID
     global KEY
     global wifi_config_scans
+    global pico_IP
+    global pico_MAC
+    global checkConnectionCounter
     # start updating task
     asyncio.create_task(reset_button_reader())
     try:
@@ -745,6 +773,9 @@ async def main():
     # Connect to WLAN
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+    wlan.config(pm=0)
+    mac_bytes = wlan.config('mac')
+    pico_MAC = binascii.hexlify(mac_bytes, ':').decode().upper()
     if not wlan.isconnected():
         print(f"Connecting to {SSID}...")
         decryptedKEY = decrypt.decrypt_aes_cbc(KEY)
@@ -764,7 +795,8 @@ async def main():
             time.sleep(5)
             machine.soft_reset()
         print("Connected to Wi-Fi")
-        print(f"IP address: {wlan.ifconfig()}")  # Print the IP address
+        pico_IP = wlan.ifconfig()[0]
+        print(f"IP address: {pico_IP}")  # Print the IP address
         if SSID_complete and KEY_complete:
             copy_file('wifi.json', 'wifi-backup.json')
         ipAddr = ip_to_uint16(wlan.ifconfig()[0])
@@ -796,11 +828,48 @@ async def main():
     # main task to control automatic logging
     while True:
        await loggingController()
-
+       checkConnectionCounter += 1
+       if checkConnectionCounter % 30 == 0:
+           print("checking WiFi connection")
+           try:
+               response = requests.get(f"http://{wlan.ifconfig()[2]}/", timeout=10)
+               response.close()
+               gc.collect()
+               if pico_IP.split('.')[3] != wlan.ifconfig()[0].split('.')[3]:
+                   pico_IP = wlan.ifconfig()[0]
+                   ipAddr = ip_to_uint16(pico_IP)
+                   beacon.startiBeacon(ipAddr[0], ipAddr[1])
+           except Exception as e:
+               print(f"Request Error 1: {e}")
+               led.value(1)
+               decryptedKEY = decrypt.decrypt_aes_cbc(KEY)
+               wlan.connect(SSID, decryptedKEY)
+               if pico_IP.split('.')[3] != wlan.ifconfig()[0].split('.')[3]:
+                   pico_IP = wlan.ifconfig()[0]
+                   ipAddr = ip_to_uint16(pico_IP)
+                   beacon.startiBeacon(ipAddr[0], ipAddr[1])
+               led.value(0)
+               try:
+                   response = requests.get(f"http://google.com/generate_204", timeout=10)
+                   response.close()
+               except Exception as e:
+                   print(f"Request Error 2: {e}")
+                   for i in range(10):
+                       led.value(1)
+                       time.sleep(0.17)
+                       led.value(0)
+                       time.sleep(0.17)
+                   machine.reset() # hard reset
+           checkConnectionCounter = 1
+           
 # start asyncio task and loop
 try:
     # start the main async tasks
     asyncio.run(main())
+except Exception as e:
+            print(f"\nFATAL ERROR: {e}")
+            time.sleep(10)
+            machine.reset() # hard reset
 finally:
     # reset and start a new event loop for the task scheduler
     asyncio.new_event_loop()
