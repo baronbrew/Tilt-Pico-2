@@ -39,11 +39,12 @@ consecutive_enomem_errors = 0
 checkLoggingCounter = 4
 checkConnectionCounter = 1
 pico_IP = '0.0.0.0'
-TP_ver = 1005
+TP_ver = 1006
 pico_MAC = '00:00:00:00:00'
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
+    global checkConnectionCounter
     print(lastLogged)
     # Only log if interval has passed
     for config_file in os.listdir():
@@ -135,11 +136,12 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
                     print(f"Error: HTTP {response.status_code}")  # Handle other errors
                     lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + response.status_code + ' ' + str(time.time())
                     await asyncio.sleep(5)
+                checkConnectionCounter = 1
             except OSError as e:
                 print(f"Error: Network issue or other error: {e}")
                 lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + e + ' ' + str(time.time())
                 if e.args[0] == 12:
-                    consecutive_enomem_errors +=1
+                    consecutive_enomem_errors += 1
                     gc.collect()
                     if consecutive_enomem_errors >= ENOMEM_RETRY_THRESHOLD:
                         await asyncio.sleep(2)
@@ -409,14 +411,14 @@ async def handle_request(reader, writer):
     global tiltScanList
     global led_flash_interval
     global TP_ver
+    global checkConnectionCounter
     reset = False
     try:
         # allow other tasks to run while waiting for data
         raw_request = await reader.read(2048)
-
         request = RequestParser(raw_request)
-
         response_builder = ResponseBuilder()
+        checkConnectionCounter = 1
 
         # filter out api request
         if request.url_match('/'):
@@ -829,38 +831,23 @@ async def main():
     while True:
        await loggingController()
        checkConnectionCounter += 1
-       if checkConnectionCounter % 30 == 0:
+       if checkConnectionCounter % 100 == 0:
            print("checking WiFi connection")
            try:
-               response = requests.get(f"http://{wlan.ifconfig()[2]}/", timeout=10)
-               response.close()
-               gc.collect()
-               if pico_IP.split('.')[3] != wlan.ifconfig()[0].split('.')[3]:
-                   pico_IP = wlan.ifconfig()[0]
-                   ipAddr = ip_to_uint16(pico_IP)
-                   beacon.startiBeacon(ipAddr[0], ipAddr[1])
+                response = requests.get(f"http://google.com/generate_204", timeout=10)
+                response.close()
+                checkConnectionCounter = 1
+                gc.collect()
            except Exception as e:
-               print(f"Request Error 1: {e}")
-               led.value(1)
-               decryptedKEY = decrypt.decrypt_aes_cbc(KEY)
-               wlan.connect(SSID, decryptedKEY)
-               if pico_IP.split('.')[3] != wlan.ifconfig()[0].split('.')[3]:
-                   pico_IP = wlan.ifconfig()[0]
-                   ipAddr = ip_to_uint16(pico_IP)
-                   beacon.startiBeacon(ipAddr[0], ipAddr[1])
-               led.value(0)
-               try:
-                   response = requests.get(f"http://google.com/generate_204", timeout=10)
-                   response.close()
-               except Exception as e:
-                   print(f"Request Error 2: {e}")
-                   for i in range(10):
-                       led.value(1)
-                       time.sleep(0.17)
-                       led.value(0)
-                       time.sleep(0.17)
-                   machine.reset() # hard reset
-           checkConnectionCounter = 1
+                print(f"Request Error 2: {e}")
+                number_flashes = 0
+                while True:
+                    led.toggle()
+                    time.sleep(0.05)
+                    number_flashes += 1
+                    if number_flashes > 100:
+                        break   
+                machine.reset() # hard reset
            
 # start asyncio task and loop
 try:
