@@ -6,7 +6,7 @@ import decrypt
 from PacketReassembler import PacketReassembler
 import network, socket, time
 import ntptime
-import urequests as requests
+import requests
 from time import sleep
 import machine
 from micropython import const
@@ -39,7 +39,7 @@ consecutive_enomem_errors = 0
 checkLoggingCounter = 4
 checkConnectionCounter = 1
 pico_IP = '0.0.0.0'
-TP_ver = 1006
+TP_ver = 1007
 pico_MAC = '00:00:00:00:00'
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
@@ -124,11 +124,16 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
                 print("sending...")
                 print(f"Free memory before HTTPS attempt: {gc.mem_free()} bytes")
                 loggingCheckCounter = 0
-                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment, timeout = 30)
+                response = requests.post(cloudurl, headers = { "Content-Type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment, timeout = 30 )
                 print(response.status_code)
-                if response.status_code == 200:
-                    print(response.text)  # Process the successful response
+                if response.status_code == 200 or response.status_code == 400:
+                    #print(response.text)
+                    checkConnectionCounter = 1
+                    lastLogged[color] = time.time()
                     if 'success' in response.text.lower() or 'ok' in response.text.lower():
+                        lastLogged[color + ' ' + cloudurl + ' result'] = 'success ' + str(time.time())
+                    elif response.status_code == 400:
+                        #workaround for Google Sheets error
                         lastLogged[color + ' ' + cloudurl + ' result'] = 'success ' + str(time.time())
                     else:
                         lastLogged[color + ' ' + cloudurl + ' result'] = 'success_not_in_resp ' + str(time.time())
@@ -136,7 +141,6 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
                     print(f"Error: HTTP {response.status_code}")  # Handle other errors
                     lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + response.status_code + ' ' + str(time.time())
                     await asyncio.sleep(5)
-                checkConnectionCounter = 1
             except OSError as e:
                 print(f"Error: Network issue or other error: {e}")
                 lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + e + ' ' + str(time.time())
@@ -154,7 +158,6 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
             finally:
                 if 'response' in locals() and response is not None: # check to see if response was defined. Prevents an error if the request failed before response was assigned.
                     response.close()  # Important: Close the response to free up resources
-                lastLogged[color] = time.time()
                 gc.collect()
                 print(lastLogged)
                 break
@@ -180,8 +183,6 @@ def convertToExcelTime(gmt_time, timeZoneOffsetSec):
         unixFractionOfDay += 10000000
     else:
         excelDayOnly = int(unixTimeStampLocal / 86400 + 25569)
-    if unixFractionOfDay > 9959999:
-            excelDayOnly -= 1
     excelTimeStamp = str(excelDayOnly) + '.' + "{:07d}".format(int(unixFractionOfDay))
     return excelTimeStamp
 
