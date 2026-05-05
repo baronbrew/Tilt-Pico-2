@@ -177,14 +177,14 @@ def processCalibrationValues(cal_points):
     
 def convertToExcelTime(gmt_time, timeZoneOffsetSec):
     unixTimeStampLocal = gmt_time - timeZoneOffsetSec
-    unixFractionOfDay = 115.74 * (unixTimeStampLocal - int(unixTimeStampLocal / 86400) * 86400)
-    if unixFractionOfDay < 0:
-        excelDayOnly = int((unixTimeStampLocal / 86400 + 25569) - 1)
-        unixFractionOfDay += 10000000
-    else:
-        excelDayOnly = int(unixTimeStampLocal / 86400 + 25569)
-    excelTimeStamp = str(excelDayOnly) + '.' + "{:07d}".format(int(unixFractionOfDay))
-    return excelTimeStamp
+    days_since_epoch = unixTimeStampLocal // 86400
+    seconds_in_day   = unixTimeStampLocal -  days_since_epoch * 86400
+    excelDayOnly = days_since_epoch + 25569
+    fraction = (seconds_in_day * 10000000 + 43200) // 86400
+    if fraction >= 10000000:
+        fraction -= 10000000
+        excelDayOnly += 1
+    return "{}.{:07d}".format(excelDayOnly, fraction)
 
 def saveWiFi(SSID, KEY):
  jsonWiFi = { "SSID" : SSID, "KEY" : KEY }
