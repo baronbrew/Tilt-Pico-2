@@ -6,7 +6,7 @@ import decrypt
 from PacketReassembler import PacketReassembler
 import network, socket, time
 import ntptime
-import requests
+import urequests as requests
 from time import sleep
 import machine
 from micropython import const
@@ -37,14 +37,12 @@ tiltColors = [ 'RED', 'GREEN', 'BLACK', 'PURPLE', 'ORANGE', 'BLUE', 'YELLOW', 'P
 ENOMEM_RETRY_THRESHOLD = 3
 consecutive_enomem_errors = 0
 checkLoggingCounter = 4
-checkConnectionCounter = 1
 pico_IP = '0.0.0.0'
-TP_ver = 1007
+TP_ver = 1005
 pico_MAC = '00:00:00:00:00'
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
-    global checkConnectionCounter
     print(lastLogged)
     # Only log if interval has passed
     for config_file in os.listdir():
@@ -99,7 +97,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
         logColor = color.split('-')[0].split('_')[0] + ':' + color.split('_')[1].upper()
     else:
         logColor = color
-    #print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
+    print('Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment)
     cloudurls = tiltAppData.get('cloudurls', 'unknown').split(',')
     print(cloudurls)
     if cloudurls == ['', '', ''] and not tiltAppData.get('logLocally', 'false') == 'true':
@@ -118,22 +116,17 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     if SSID == '' and KEY == '':
         return
     for cloudurl in cloudurls:
-     if cloudurl is not '':
+     if cloudurl.startswith('https://ezbrew.base44.app'):
         while True:
             try:
                 print("sending...")
                 print(f"Free memory before HTTPS attempt: {gc.mem_free()} bytes")
                 loggingCheckCounter = 0
-                response = requests.post(cloudurl, headers = { "Content-Type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment, timeout = 30 )
+                response = requests.post(cloudurl, headers = { "content-type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment, timeout = 30)
                 print(response.status_code)
-                if response.status_code == 200 or response.status_code == 400:
-                    #print(response.text)
-                    checkConnectionCounter = 1
-                    lastLogged[color] = time.time()
+                if response.status_code == 200:
+                    print(response.text)  # Process the successful response
                     if 'success' in response.text.lower() or 'ok' in response.text.lower():
-                        lastLogged[color + ' ' + cloudurl + ' result'] = 'success ' + str(time.time())
-                    elif response.status_code == 400:
-                        #workaround for Google Sheets error
                         lastLogged[color + ' ' + cloudurl + ' result'] = 'success ' + str(time.time())
                     else:
                         lastLogged[color + ' ' + cloudurl + ' result'] = 'success_not_in_resp ' + str(time.time())
@@ -145,7 +138,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
                 print(f"Error: Network issue or other error: {e}")
                 lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + e + ' ' + str(time.time())
                 if e.args[0] == 12:
-                    consecutive_enomem_errors += 1
+                    consecutive_enomem_errors +=1
                     gc.collect()
                     if consecutive_enomem_errors >= ENOMEM_RETRY_THRESHOLD:
                         await asyncio.sleep(2)
@@ -158,9 +151,10 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
             finally:
                 if 'response' in locals() and response is not None: # check to see if response was defined. Prevents an error if the request failed before response was assigned.
                     response.close()  # Important: Close the response to free up resources
+                #lastLogged[color] = time.time()
                 gc.collect()
                 print(lastLogged)
-                break
+                break  
     led.value(0)
 
 def processCalibrationValues(cal_points):
@@ -183,6 +177,8 @@ def convertToExcelTime(gmt_time, timeZoneOffsetSec):
         unixFractionOfDay += 10000000
     else:
         excelDayOnly = int(unixTimeStampLocal / 86400 + 25569)
+    if unixFractionOfDay > 9959999:
+            excelDayOnly -= 1
     excelTimeStamp = str(excelDayOnly) + '.' + "{:07d}".format(int(unixFractionOfDay))
     return excelTimeStamp
 
@@ -298,7 +294,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
                       TIMESTAMP = time.time()
                       tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
                       tiltScanList = await sort_objects_by_key_value(tiltScanList, 'timestamp')
-                      if len(tiltScanList) > 16:
+                      if len(tiltScanList) > 3:
                           tiltScanList.pop()
 
 async def create_settings_file(color, data, targetTiltScan):
@@ -412,14 +408,14 @@ async def handle_request(reader, writer):
     global tiltScanList
     global led_flash_interval
     global TP_ver
-    global checkConnectionCounter
     reset = False
     try:
         # allow other tasks to run while waiting for data
         raw_request = await reader.read(2048)
+
         request = RequestParser(raw_request)
+
         response_builder = ResponseBuilder()
-        checkConnectionCounter = 1
 
         # filter out api request
         if request.url_match('/'):
@@ -691,7 +687,7 @@ def url_decode(s):
             i += 1
     return "".join(decoded_chars)
 
-async def loggingController(period = 5, scanlength = 3030):
+async def loggingController(period = 0, scanlength = 3030):
     global checkLoggingCounter
     if checkLoggingCounter % 5 == 0:
         try: 
@@ -831,24 +827,7 @@ async def main():
     # main task to control automatic logging
     while True:
        await loggingController()
-       checkConnectionCounter += 1
-       if checkConnectionCounter % 100 == 0:
-           print("checking WiFi connection")
-           try:
-                response = requests.get(f"http://google.com/generate_204", timeout=10)
-                response.close()
-                checkConnectionCounter = 1
-                gc.collect()
-           except Exception as e:
-                print(f"Request Error 2: {e}")
-                number_flashes = 0
-                while True:
-                    led.toggle()
-                    time.sleep(0.05)
-                    number_flashes += 1
-                    if number_flashes > 100:
-                        break   
-                machine.reset() # hard reset
+           
            
 # start asyncio task and loop
 try:
@@ -861,3 +840,4 @@ except Exception as e:
 finally:
     # reset and start a new event loop for the task scheduler
     asyncio.new_event_loop()
+

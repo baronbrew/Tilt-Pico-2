@@ -1,6 +1,6 @@
 # Request object to handle http requests
-import ure as re
-import ujson as json
+import re
+import json
 
 class RequestParser:
 
