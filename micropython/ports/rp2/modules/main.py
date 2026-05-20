@@ -38,6 +38,7 @@ ENOMEM_RETRY_THRESHOLD = 3
 consecutive_enomem_errors = 0
 checkLoggingCounter = 4
 checkConnectionCounter = 1
+failed_checks = 0
 pico_IP = '0.0.0.0'
 TP_ver = 1007
 pico_MAC = '00:00:00:00:00'
@@ -353,6 +354,9 @@ async def reset_button_reader():
             delete_file('wifi.json')
             delete_file('wifi-backup.json')
             await asyncio.sleep(2)
+            p = machine.Pin(23, machine.Pin.OUT)
+            p.value(0)
+            time.sleep(2)
             machine.reset()
         await asyncio.sleep_ms(10)
 
@@ -567,8 +571,10 @@ async def handle_request(reader, writer):
         led.value(0)
         if reset:
             await asyncio.sleep(5)
-            machine.soft_reset()
-
+            p = machine.Pin(23, machine.Pin.OUT)
+            p.value(0)
+            time.sleep(2)
+            machine.reset()
     except OSError as e:
         print('connection error ' + str(e.errno) + " " + str(e))
         
@@ -613,7 +619,7 @@ def copy_file(source_path, destination_path):
         print(f"Error copying file: {e}, will save wifi.json instead")
         saveWiFi(SSID, KEY)
 
-def log_to_csv(filename: str, data: list, max_size_kb: int = 200, header: list = None):
+def log_to_csv(filename: str, data: list, max_size_kb: int = 180, header: list = None):
     max_bytes = max_size_kb * 1024
     line_to_add = ','.join(map(str, data)) + '\n'
     line_to_add_bytes = len(line_to_add.encode('utf-8'))
@@ -739,6 +745,46 @@ def get_pico_mac_address():
     wlan.active(True)
     mac_bytes = wlan.config('mac')
     mac_hex = bibinascii.hexlify(mac_bytes, ':').decode().upper()
+    
+import machine
+import time
+import network
+
+def recover_wifi(ssid, password, max_attempts=3):
+    for attempt in range(max_attempts):
+        print(f"Recovery attempt {attempt + 1}/{max_attempts}")
+        wlan = network.WLAN(network.STA_IF)
+        print(f"networks available: {len(wlan.scan())}")
+        if len(wlan.scan()) > 0:
+            beacon.startiBeacon(999, 997) #notify app with iBeacon if possible
+        if attempt == 0:           # Level 1: Normal reconnect
+            wlan.connect(ssid, password)
+            ipAddr = ip_to_uint16(wlan.ifconfig()[0])
+            beacon.startiBeacon(ipAddr[0], ipAddr[1])
+        elif attempt == 1:         # Level 2: Soft WiFi reset
+            wlan.active(False)
+            time.sleep(1)
+            wlan.active(True)
+            time.sleep(1)
+            wlan.connect(ssid, password)
+            ipAddr = ip_to_uint16(wlan.ifconfig()[0])
+            beacon.startiBeacon(ipAddr[0], ipAddr[1])
+        else:                      # Level 3: Full power cycle
+            p = machine.Pin(23, machine.Pin.OUT)
+            p.value(0)
+            time.sleep(2)
+            machine.reset()                # Force a clean reboot after power cycle
+        
+        # Check if connected
+        start = time.time()
+        while time.time() - start < 12:
+            if wlan.isconnected():
+                print("Successfully reconnected!")
+                return True
+            time.sleep(1)
+    
+    print("Recovery failed")
+    return False
 
 # main coroutine to boot async tasks
 async def main():
@@ -753,6 +799,7 @@ async def main():
     global pico_IP
     global pico_MAC
     global checkConnectionCounter
+    global failed_checks
     # start updating task
     asyncio.create_task(reset_button_reader())
     try:
@@ -779,9 +826,9 @@ async def main():
     wlan.config(pm=0)
     mac_bytes = wlan.config('mac')
     pico_MAC = binascii.hexlify(mac_bytes, ':').decode().upper()
+    decryptedKEY = decrypt.decrypt_aes_cbc(KEY)
     if not wlan.isconnected():
         print(f"Connecting to {SSID}...")
-        decryptedKEY = decrypt.decrypt_aes_cbc(KEY)
         print(decryptedKEY)
         wlan.connect(SSID, decryptedKEY)  # Connect to the network
         # Wait for connection with timeout
@@ -813,15 +860,15 @@ async def main():
             if wlan.isconnected():
                 break
             await asyncio.sleep_ms(100)  # Non-blocking delay
-        print("Still not connected, resetting") 
-        beacon.startiBeacon(999, 997) #notify app
+        print("Still not connected, resetting")
+        print(SSID, decryptedKEY)
         if delete_file('wifi.json'):
             await asyncio.sleep(5)
-            machine.reset()
+            recover_wifi(SSID, decryptedKEY)
         else:
-            machine.reset()
+            recover_wifi(SSID, decryptedKEY)
     else:
-        machine.reset()
+        recover_wifi(SSID, decryptedKEY)
         
     # start web server task
     print('Setting up webserver...')
@@ -832,24 +879,31 @@ async def main():
     while True:
        await loggingController()
        checkConnectionCounter += 1
-       if checkConnectionCounter % 100 == 0:
+       print(f"Checking connection in {checkConnectionCounter} out of 10")
+       if checkConnectionCounter % 10 == 0:
            print("checking WiFi connection")
            try:
                 response = requests.get(f"http://google.com/generate_204", timeout=10)
                 response.close()
                 checkConnectionCounter = 1
+                failed_checks = 0
                 gc.collect()
            except Exception as e:
-                print(f"Request Error 2: {e}")
+                failed_checks += 1
+                print(f"Request Error {failed_checks} of 3: {e}")
                 number_flashes = 0
-                while True:
-                    led.toggle()
-                    time.sleep(0.05)
-                    number_flashes += 1
-                    if number_flashes > 100:
-                        break   
-                machine.reset() # hard reset
-           
+                if failed_checks >= 3:
+                    while True:
+                        led.toggle()
+                        time.sleep(0.05)
+                        number_flashes += 1
+                        if number_flashes > 100:
+                            break   
+                    recover_wifi(SSID, decryptedKEY) # hard reset
+                else:
+                    checkConnectionCounter = 1
+                    
+                    
 # start asyncio task and loop
 try:
     # start the main async tasks
