@@ -40,7 +40,7 @@ checkLoggingCounter = 4
 checkConnectionCounter = 1
 failed_checks = 0
 pico_IP = '0.0.0.0'
-TP_ver = 1007
+TP_ver = 1008
 pico_MAC = '00:00:00:00:00'
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
