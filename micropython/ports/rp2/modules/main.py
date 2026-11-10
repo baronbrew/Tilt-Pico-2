@@ -3,9 +3,31 @@
 # free block is only ~7.5KB, and the HTTPS handshake (needs a ~16KB+ contiguous buffer) fails
 # with ENOMEM. logToCloud releases this block right before each HTTPS post and re-takes it after.
 import gc
-gc.collect()
 TLS_RESERVE_BYTES = 32 * 1024
-tls_reserve = bytearray(TLS_RESERVE_BYTES)
+
+def alloc_high(size, chunk=2048):
+    # Allocate a block near the TOP of the heap. The allocator is first-fit from the bottom, so
+    # small objects created while the reserve is released (during a post) fill low holes first
+    # and don't end up stranded inside this region, which would stop it being re-reserved.
+    # Trick: temporarily fill free memory from the bottom with filler chunks, allocate, free filler.
+    gc.collect()
+    filler = []
+    try:
+        while gc.mem_free() > size + 4 * chunk:
+            filler.append(bytearray(chunk))
+    except MemoryError:
+        pass
+    try:
+        block = bytearray(size)
+    except MemoryError:
+        block = None
+    filler = None
+    gc.collect()
+    if block is None:
+        block = bytearray(size)  # fall back to anywhere; raises MemoryError if no room at all
+    return block
+
+tls_reserve = alloc_high(TLS_RESERVE_BYTES)
 
 from RequestParser import RequestParser
 from ResponseBuilder import ResponseBuilder
@@ -186,7 +208,9 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
             # requests.post is blocking, so no other task can grab the gap before TLS does.
             release_tls_memory()
             print(f"Free memory before HTTPS attempt: {gc.mem_free()} bytes")
-            response = requests.post(cloudurl, headers = HTTP_HEADERS, data = post_data, timeout = 30 )
+            # Pass a fresh copy: requests writes Host/Content-Length/Connection into the dict it's
+            # given, so reusing HTTP_HEADERS would send the first post's Content-Length forever (HTTP 400).
+            response = requests.post(cloudurl, headers = dict(HTTP_HEADERS), data = post_data, timeout = 30 )
             print(response.status_code)
             if response.status_code == 200 or response.status_code == 400:
                 #print(response.text)
@@ -241,13 +265,13 @@ def release_tls_memory():
 
 def reserve_tls_memory():
     global tls_reserve
-    gc.collect()
     if tls_reserve is None:
         try:
-            tls_reserve = bytearray(TLS_RESERVE_BYTES)
+            tls_reserve = alloc_high(TLS_RESERVE_BYTES)
         except MemoryError:
             # Heap too fragmented to get the block back; next post just relies on gc.collect()
             print("Could not re-reserve TLS memory block")
+            micropython.mem_info()
 
 def processCalibrationValues(cal_points):
         proc_cal_points = []
