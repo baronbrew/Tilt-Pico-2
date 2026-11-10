@@ -62,6 +62,13 @@ TILT_MAX_ENTRIES = 16      # hard cap on Tilts kept in memory
 TILT_EXPIRE_S = 120        # drop a Tilt not heard from in this many seconds
 TILT_SCAN_MIN_GAP_MS = 5000  # skip a new BLE scan if the last one was this recent
 last_tilt_scan_ms = None
+# Background scanner (normal mode): listens TILT_SCAN_MS, pauses TILT_SCAN_GAP_MS (~75% duty),
+# so a Tilt advertising every few seconds is heard many times per minute.
+TILT_SCAN_MS = 3000
+TILT_SCAN_GAP_MS = 1000
+bg_scanner_running = False   # True once tilt_scan_loop() owns BLE scanning
+scanner_active = False       # a background scan is in progress right now
+http_busy = False            # an HTTPS post is running: background scanner holds off
 targetTiltScan = {}
 lastLogged = {}
 SSID_complete = False
@@ -119,6 +126,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
     global checkConnectionCounter
     global consecutive_enomem_errors
+    global http_busy
     if not clock_is_set():
         # Timestamps would be from 2021 (no NTP sync yet); time_keeper() will fix the clock
         print('Clock not synced yet, skipping log for ' + color)
@@ -204,6 +212,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
         try:
             print("sending...")
             post_data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment
+            await wait_for_scanner_idle()  # pause background BLE scanning during the post
             # The TLS handshake needs a large *contiguous* block: hand it the reserved block.
             # requests.post is blocking, so no other task can grab the gap before TLS does.
             release_tls_memory()
@@ -255,6 +264,7 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
                     pass
             response = None
             reserve_tls_memory()  # take the block back now that TLS has freed it
+            http_busy = False     # background BLE scanning can resume
             print(lastLogged)
     led.value(0)
 
@@ -313,6 +323,8 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
   KEY_complete = False
   reassembler_1 = PacketReassembler()
   if SCANFOR == 'tilts':
+      if bg_scanner_running:
+          return False  # the background scanner keeps tiltScanList fresh; don't start a 2nd scan
       if last_tilt_scan_ms is not None and time.ticks_diff(time.ticks_ms(), last_tilt_scan_ms) < TILT_SCAN_MIN_GAP_MS:
           return False  # scanned moments ago; the current list is fresh enough
       last_tilt_scan_ms = time.ticks_ms()
@@ -352,6 +364,37 @@ def update_tilt_list(uuid, mac, major, minor, tx_power, rssi):
               oldest = i
       tiltScanList.pop(oldest)
   tiltScanList.append({ "uuid" : uuid, "mac" : mac, "major" : major, "minor" : minor, "tx_power" : tx_power, "rssi" : rssi, "timestamp" : now })
+
+async def tilt_scan_loop():
+  # Normal-mode background scanner: keeps tiltScanList fresh so the web server and logging just
+  # read it. Holds off while an HTTPS post runs so Wi-Fi has the shared CYW43 radio to itself.
+  global bg_scanner_running, scanner_active
+  bg_scanner_running = True
+  while True:
+      if http_busy:
+          await asyncio.sleep_ms(200)
+          continue
+      scanner_active = True
+      prune_tilt_list()
+      try:
+          await asyncio.wait_for_ms(_run_scan(TILT_SCAN_MS, 'tilts', None), TILT_SCAN_MS + 2000)
+      except asyncio.TimeoutError:
+          print('background tilt scan timed out')
+      except Exception as e:
+          print('background tilt scan error:', e)
+      finally:
+          scanner_active = False
+          tiltScanList.sort(key=lambda t: t.get('timestamp', 0), reverse=True)
+      await asyncio.sleep_ms(TILT_SCAN_GAP_MS)
+
+async def wait_for_scanner_idle(max_ms=TILT_SCAN_MS + 3000):
+  # Called before an HTTPS post: stop new background scans and let the current one finish.
+  global http_busy
+  http_busy = True
+  waited = 0
+  while scanner_active and waited < max_ms:
+      await asyncio.sleep_ms(50)
+      waited += 50
 
 async def _run_scan(SCANLENGTH, SCANFOR, reassembler_1):
   global led_flash_interval
@@ -1196,6 +1239,8 @@ async def main():
     asyncio.create_task(server)
     # keep the clock synced (retry if the internet wasn't up at boot; hourly drift correction)
     asyncio.create_task(time_keeper())
+    # continuous Tilt scanning in the background (the web server and logging just read the list)
+    asyncio.create_task(tilt_scan_loop())
 
     # main task to control automatic logging
     while True:
