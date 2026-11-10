@@ -1,3 +1,12 @@
+# Reserve one contiguous block for TLS *before* anything else fragments the heap. Over time BLE
+# scans, tasks and strings scatter long-lived objects so that e.g. 129KB is free but the largest
+# free block is only ~7.5KB, and the HTTPS handshake (needs a ~16KB+ contiguous buffer) fails
+# with ENOMEM. logToCloud releases this block right before each HTTPS post and re-takes it after.
+import gc
+gc.collect()
+TLS_RESERVE_BYTES = 32 * 1024
+tls_reserve = bytearray(TLS_RESERVE_BYTES)
+
 from RequestParser import RequestParser
 from ResponseBuilder import ResponseBuilder
 import calibration
@@ -21,11 +30,16 @@ import ujson
 import os
 import rp2
 import gc
+import micropython
 from machine import Pin
 led = Pin("LED", Pin.OUT)
 led.value(0)
 led_flash_interval = [5, False]
-tiltScanList = []
+tiltScanList = []          # one entry per Tilt (keyed by mac + uuid), newest first
+TILT_MAX_ENTRIES = 16      # hard cap on Tilts kept in memory
+TILT_EXPIRE_S = 120        # drop a Tilt not heard from in this many seconds
+TILT_SCAN_MIN_GAP_MS = 5000  # skip a new BLE scan if the last one was this recent
+last_tilt_scan_ms = None
 targetTiltScan = {}
 lastLogged = {}
 SSID_complete = False
@@ -40,12 +54,54 @@ checkLoggingCounter = 4
 checkConnectionCounter = 1
 failed_checks = 0
 pico_IP = '0.0.0.0'
-TP_ver = 1008
+TP_ver = 1009
 pico_MAC = '00:00:00:00:00'
+# Browser-like headers: some ISP gateways' security filters drop requests with no User-Agent
+HTTP_HEADERS = {
+    "Content-Type" : 'application/x-www-form-urlencoded; charset=utf-8',
+    "User-Agent" : 'Mozilla/5.0 (compatible; TiltPico/' + str(TP_ver) + ')',
+    "Accept" : '*/*',
+    "Accept-Language" : 'en-US,en;q=0.9',
+}
+FALLBACK_DNS = '8.8.8.8'
+# Where this boot's Wi-Fi credentials came from: 'saved' (wifi.json), 'backup' (wifi-backup.json,
+# last known good) or 'app' (just received over BLE, not yet proven to work)
+creds_source = 'saved'
+# iBeacon minor advertised while saved credentials can't connect (router down) and the Pico is
+# retrying while listening for new setup from the app. 999 (= needs setup) so the app offers
+# Wi-Fi setup; the app will show "needs setup" during an outage, which is intended.
+# (999/998 = NTP failed, 999/997 = recover_wifi in progress)
+WIFI_WAIT_BEACON_MINOR = 999
+# While waiting: listen (Wi-Fi off) for this long, then try to connect for this long
+WIFI_WAIT_LISTEN_S = 45
+WIFI_WAIT_CONNECT_S = 15
+# Keep listening while setup packets from the app arrived within this many seconds
+WIFI_SETUP_IDLE_S = 10
+# Time allowed for newly received credentials to connect (same as a normal boot: 20s + 10s)
+WIFI_NEW_CREDS_CONNECT_S = 30
+# Set by tiltscanner: when the last setup packet from the app arrived, and when a full set is in
+last_config_packet_ms = None
+creds_received = False
+# Clock: before the first NTP sync the Pico's clock reads 2021, so anything earlier than
+# 2025-01-01 means "not set". Retry NTP every NTP_RETRY_S until set, then re-sync every
+# NTP_RESYNC_S to correct crystal drift (~2-3 s/day).
+MIN_VALID_TIME = 1735689600
+NTP_RETRY_S = 30
+NTP_RESYNC_S = 3600
+# Connectivity check runs about once a minute. If Wi-Fi stays connected but the internet is
+# unreachable for this many checks (~30 min), rejoin Wi-Fi (no reboot) in case the link is stale.
+INTERNET_DOWN_REJOIN_CHECKS = 30
+last_ntp_sync = 0
 
 async def logToCloud(color, cloudinterval, passedTiltScan):
     global lastLogged
     global checkConnectionCounter
+    global consecutive_enomem_errors
+    if not clock_is_set():
+        # Timestamps would be from 2021 (no NTP sync yet); time_keeper() will fix the clock
+        print('Clock not synced yet, skipping log for ' + color)
+        led.value(0)
+        return False
     print(lastLogged)
     # Only log if interval has passed
     for config_file in os.listdir():
@@ -119,50 +175,79 @@ async def logToCloud(color, cloudinterval, passedTiltScan):
     if SSID == '' and KEY == '':
         return
     for cloudurl in cloudurls:
-     if cloudurl is not '':
-        while True:
-            try:
-                print("sending...")
-                print(f"Free memory before HTTPS attempt: {gc.mem_free()} bytes")
-                loggingCheckCounter = 0
-                response = requests.post(cloudurl, headers = { "Content-Type" : 'application/x-www-form-urlencoded; charset=utf-8' }, data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment, timeout = 30 )
-                print(response.status_code)
-                if response.status_code == 200 or response.status_code == 400:
-                    #print(response.text)
-                    checkConnectionCounter = 1
-                    lastLogged[color] = time.time()
-                    if 'success' in response.text.lower() or 'ok' in response.text.lower():
-                        lastLogged[color + ' ' + cloudurl + ' result'] = 'success ' + str(time.time())
-                    elif response.status_code == 400:
-                        #workaround for Google Sheets error
-                        lastLogged[color + ' ' + cloudurl + ' result'] = 'success ' + str(time.time())
-                    else:
-                        lastLogged[color + ' ' + cloudurl + ' result'] = 'success_not_in_resp ' + str(time.time())
-                else:
-                    print(f"Error: HTTP {response.status_code}")  # Handle other errors
-                    lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + response.status_code + ' ' + str(time.time())
-                    await asyncio.sleep(5)
-            except OSError as e:
-                print(f"Error: Network issue or other error: {e}")
-                lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + e + ' ' + str(time.time())
-                if e.args[0] == 12:
-                    consecutive_enomem_errors += 1
-                    gc.collect()
-                    if consecutive_enomem_errors >= ENOMEM_RETRY_THRESHOLD:
-                        await asyncio.sleep(2)
-                        machine.soft_reset()
-                else:
-                    consecutive_enomem_errors = 0
-            except Exception as e:
+     if cloudurl != '':
+        # NOTE: MicroPython's locals() returns the module globals, so the old
+        # "'response' in locals()" check never closed the socket. Track it explicitly.
+        response = None
+        try:
+            print("sending...")
+            post_data = 'Timepoint=' + excelTimeStamp + '&SG=' + str(sg) + '&Temp=' + str(temp) + '&Color=' + logColor.split('-')[0] + '&Beer=' + tiltAppData.get('beername', 'unknown') + '&Comment=' + comment
+            # The TLS handshake needs a large *contiguous* block: hand it the reserved block.
+            # requests.post is blocking, so no other task can grab the gap before TLS does.
+            release_tls_memory()
+            print(f"Free memory before HTTPS attempt: {gc.mem_free()} bytes")
+            response = requests.post(cloudurl, headers = HTTP_HEADERS, data = post_data, timeout = 30 )
+            print(response.status_code)
+            if response.status_code == 200 or response.status_code == 400:
+                #print(response.text)
+                checkConnectionCounter = 1
                 consecutive_enomem_errors = 0
-                        
-            finally:
-                if 'response' in locals() and response is not None: # check to see if response was defined. Prevents an error if the request failed before response was assigned.
-                    response.close()  # Important: Close the response to free up resources
+                lastLogged[color] = time.time()
+                if 'success' in response.text.lower() or 'ok' in response.text.lower():
+                    lastLogged[color + ' ' + cloudurl + ' result'] = 'success ' + str(time.time())
+                elif response.status_code == 400:
+                    #workaround for Google Sheets error
+                    lastLogged[color + ' ' + cloudurl + ' result'] = 'success ' + str(time.time())
+                else:
+                    lastLogged[color + ' ' + cloudurl + ' result'] = 'success_not_in_resp ' + str(time.time())
+            else:
+                print(f"Error: HTTP {response.status_code}")  # Handle other errors
+                lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + str(response.status_code) + ' ' + str(time.time())
+                await asyncio.sleep(5)
+        except OSError as e:
+            print(f"Error: Network issue or other error: {e}")
+            lastLogged[color + ' ' + cloudurl + ' result'] = 'error_code_' + str(e) + ' ' + str(time.time())
+            if e.args and e.args[0] == 12:
+                consecutive_enomem_errors += 1
                 gc.collect()
-                print(lastLogged)
-                break
+                # Diagnose fragmentation: "max free sz" (in 16-byte blocks) is the largest
+                # contiguous free block, which matters more than total free memory for TLS
+                print(f"ENOMEM {consecutive_enomem_errors} of {ENOMEM_RETRY_THRESHOLD} (soft reset at {ENOMEM_RETRY_THRESHOLD}):")
+                micropython.mem_info()
+                if consecutive_enomem_errors >= ENOMEM_RETRY_THRESHOLD:
+                    await asyncio.sleep(2)
+                    machine.soft_reset()
+            else:
+                consecutive_enomem_errors = 0
+        except Exception as e:
+            print(f"Error: unexpected logging error: {e}")
+            lastLogged[color + ' ' + cloudurl + ' result'] = 'error_' + str(e) + ' ' + str(time.time())
+            consecutive_enomem_errors = 0
+        finally:
+            if response is not None:
+                try:
+                    response.close()  # Important: Close the response to free up the socket
+                except Exception:
+                    pass
+            response = None
+            reserve_tls_memory()  # take the block back now that TLS has freed it
+            print(lastLogged)
     led.value(0)
+
+def release_tls_memory():
+    global tls_reserve
+    tls_reserve = None
+    gc.collect()
+
+def reserve_tls_memory():
+    global tls_reserve
+    gc.collect()
+    if tls_reserve is None:
+        try:
+            tls_reserve = bytearray(TLS_RESERVE_BYTES)
+        except MemoryError:
+            # Heap too fragmented to get the block back; next post just relies on gc.collect()
+            print("Could not re-reserve TLS memory block")
 
 def processCalibrationValues(cal_points):
         proc_cal_points = []
@@ -197,23 +282,66 @@ def saveWiFi(SSID, KEY):
      
 
 async def tiltscanner(SCANLENGTH, SCANFOR):
+  global SSID_complete
+  global KEY_complete
+  global last_tilt_scan_ms
+  SSID_complete = False
+  KEY_complete = False
+  reassembler_1 = PacketReassembler()
+  if SCANFOR == 'tilts':
+      if last_tilt_scan_ms is not None and time.ticks_diff(time.ticks_ms(), last_tilt_scan_ms) < TILT_SCAN_MIN_GAP_MS:
+          return False  # scanned moments ago; the current list is fresh enough
+      last_tilt_scan_ms = time.ticks_ms()
+      prune_tilt_list()
+  try:
+    await _run_scan(SCANLENGTH, SCANFOR, reassembler_1)
+  finally:
+    if SCANFOR == 'tilts':
+      tiltScanList.sort(key=lambda t: t.get('timestamp', 0), reverse=True)  # newest first, sorted in place
+
+def prune_tilt_list():
+  # Drop Tilts not heard from within TILT_EXPIRE_S (removes in place, no new list).
+  now = time.time()
+  i = 0
+  while i < len(tiltScanList):
+      if now - tiltScanList[i].get('timestamp', 0) > TILT_EXPIRE_S:
+          tiltScanList.pop(i)
+      else:
+          i += 1
+
+def update_tilt_list(uuid, mac, major, minor, tx_power, rssi):
+  # Update the existing entry for this Tilt in place (no duplicates, no new dict),
+  # or add it, replacing the least recently seen Tilt if the list is full.
+  now = time.time()
+  for entry in tiltScanList:
+      if entry.get('mac') == mac and entry.get('uuid') == uuid:
+          entry['major'] = major
+          entry['minor'] = minor
+          entry['tx_power'] = tx_power
+          entry['rssi'] = rssi
+          entry['timestamp'] = now
+          return
+  if len(tiltScanList) >= TILT_MAX_ENTRIES:
+      oldest = 0
+      for i in range(1, len(tiltScanList)):
+          if tiltScanList[i].get('timestamp', 0) < tiltScanList[oldest].get('timestamp', 0):
+              oldest = i
+      tiltScanList.pop(oldest)
+  tiltScanList.append({ "uuid" : uuid, "mac" : mac, "major" : major, "minor" : minor, "tx_power" : tx_power, "rssi" : rssi, "timestamp" : now })
+
+async def _run_scan(SCANLENGTH, SCANFOR, reassembler_1):
   global led_flash_interval
   global SSID_complete
   global KEY_complete
   global SSID
   global KEY
-  global tiltScanList
   global wifi_config_scans
-  SSID_complete = False
-  KEY_complete = False
+  global creds_source
+  global last_config_packet_ms
+  global creds_received
   Part1_complete = False
   Part2_complete = False
-  reassembler_1 = PacketReassembler()
   reassembled_bytes_1 = None
-  if len(tiltScanList) > 0:
-      if time.time() - tiltScanList[0].get('timestamp', time.time()) < 5:
-          return False
-      tiltScanList.pop()
   async with aioble.scan(SCANLENGTH, interval_us=1000*1000, window_us=1000*1000, active=False) as scanner:
     async for result in scanner:
         if binascii.hexlify(result.adv_data[9:11]) == b'a495' or binascii.hexlify(result.adv_data[6:8]) == b'a495':
@@ -227,6 +355,8 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
                             KEY = data["KEY"]
                             SSID_complete = True
                             KEY_complete = True
+                            creds_source = 'backup'
+                            saveWiFi(SSID, KEY)  # restore wifi.json too, so a reboot doesn't land back in setup mode
                             led_flash_interval = [4, False]
                             break
                     except:
@@ -239,6 +369,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
                  if binascii.hexlify(result.adv_data[9:12]) == b'a495bc':
                   offSet = 3
                  led_flash_interval = [1, True]
+                 last_config_packet_ms = time.ticks_ms()  # app is mid-transfer: don't interrupt listening
                  major = int(binascii.hexlify(result.adv_data[22  + offSet : 24  + offSet]), 16)
                  minor = int(binascii.hexlify(result.adv_data[24  + offSet : 26  + offSet]), 16)
                  hex_str = binascii.hexlify(result.adv_data[10  + offSet : 22  + offSet]).decode('utf-8')
@@ -283,6 +414,8 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
                     SSID = SSID.replace('\u0000', '')
                     KEY = KEY.replace('\u0000', '')
                     saveWiFi(SSID, KEY)
+                    creds_source = 'app'
+                    creds_received = True
                     led_flash_interval = [4, False]
                     break
             elif SCANFOR == 'tilts':
@@ -295,12 +428,7 @@ async def tiltscanner(SCANLENGTH, SCANFOR):
                       MAJOR = int(binascii.hexlify(result.adv_data[ 25 + offSet : 27 + offSet ]), 16)
                       MINOR = int(binascii.hexlify(result.adv_data[ 27 + offSet : 29 + offSet ]), 16)
                       TX_POWER = str(int(binascii.hexlify(result.adv_data[ 29 + offSet : 31 + offSet ]), 16))
-                      RSSI = result.rssi
-                      TIMESTAMP = time.time()
-                      tiltScanList.append({ "uuid" : UUID, "mac" : MAC, "major" : MAJOR, "minor" : MINOR, "tx_power" : TX_POWER, "rssi" : RSSI, "timestamp" : TIMESTAMP })
-                      tiltScanList = await sort_objects_by_key_value(tiltScanList, 'timestamp')
-                      if len(tiltScanList) > 16:
-                          tiltScanList.pop()
+                      update_tilt_list(UUID, MAC, MAJOR, MINOR, TX_POWER, result.rssi)
 
 async def create_settings_file(color, data, targetTiltScan):
   global tiltColors
@@ -369,43 +497,47 @@ def delete_file(filename):
     print(f"Error deleting file '{filename}': {e}")
     return False
 
-async def set_time_from_ntp(retries=10, delay=1):
-    global tiltScanList
-    attempts = 0
-    while attempts < retries:
+def clock_is_set():
+    return time.time() > MIN_VALID_TIME
+
+async def set_time_from_ntp(retries=3, delay=2):
+    # Sync the clock once (with a few quick retries). Never resets on failure: time_keeper()
+    # keeps retrying in the background.
+    global tiltScanList, last_ntp_sync, last_tilt_scan_ms
+    was_set = clock_is_set()
+    for attempt in range(1, retries + 1):
         try:
             ntptime.host = "pool.ntp.org"  # Or your preferred NTP server
             ntptime.settime()
-            print(time.time())
-            print(time.localtime())
-            tiltScanList = [{ 'timestamp' : time.time() }]
-            return True  # Success!
+            last_ntp_sync = time.time()
+            print(f"Clock synced via NTP: {time.localtime()}")
+            if not was_set:
+                # First sync jumps the clock forward from 2021, which would make every
+                # entry look years old. Clear the list (and allow an immediate rescan).
+                tiltScanList.clear()
+                last_tilt_scan_ms = None
+            return True
+        except Exception as e:  # OSError (no internet / DNS) or a malformed reply
+            print(f"NTP sync failed (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                await asyncio.sleep(delay)  # don't block BLE / web server while waiting
+    return False
 
-        except OSError as e:
-            attempts += 1
-            print(f"NTP synchronization failed (attempt {attempts}/{retries}): {e}")
-            if attempts < retries:
-                time.sleep(delay)  # Wait before retrying
-            else:
-                print("NTP synchronization failed after multiple retries.")
-                return False
-            continue # Continue to the next attempt.
-    return False  # All attempts failed
-
-async def sort_objects_by_key_value(objects, key):
-    if not objects:  # Handle empty list case
-        return []
-
-    try:  # Try to access the key and convert to numeric for all objects.
-        # This will raise a KeyError if the key doesn't exist, or a TypeError if the value isn't comparable.
-        test_value = objects[0][key]
-        if not isinstance(test_value, (int, float)): # Check if values are numeric.
-            test_value = float(test_value) # Attempt conversion. Will throw ValueError if not possible
-
-    except (KeyError, TypeError, ValueError):
-        return objects  # Return original if any object is missing the key or not numerically comparable.
-
-    return sorted(objects, key=lambda obj: obj.get(key, 0), reverse=True) # Sort, using 0 as default value if key is missing.
+async def time_keeper():
+    # Background task. Covers (1) Wi-Fi up before the internet after a power outage: keep
+    # retrying until the first sync succeeds, and (2) clock drift: re-sync periodically.
+    while True:
+        if clock_is_set() and time.time() - last_ntp_sync < NTP_RESYNC_S:
+            await asyncio.sleep(60)
+            continue
+        if network.WLAN(network.STA_IF).isconnected():
+            if not clock_is_set():
+                ensure_dns()  # DNS may have been unreachable at boot too
+            # one try per pass: ntptime blocks for up to ~1s per attempt
+            if not await set_time_from_ntp(retries=1):
+                await asyncio.sleep(NTP_RETRY_S)
+        else:
+            await asyncio.sleep(NTP_RETRY_S)
 
 
 
@@ -417,6 +549,7 @@ async def handle_request(reader, writer):
     global led_flash_interval
     global TP_ver
     global checkConnectionCounter
+    global checkLoggingCounter  # /sync sets this to 5 so the next loggingController pass logs immediately
     reset = False
     try:
         # allow other tasks to run while waiting for data
@@ -557,7 +690,7 @@ async def handle_request(reader, writer):
             for config_file in os.listdir():
                 if config_file.startswith('config-'):
                     config_files.append(config_file)
-            response_builder.set_body_from_dict({'ip_address' : pico_IP, 'tilt_pico_version' : TP_ver,'tilt_pico_temperature_f' : temp_f, 'tilt_pico_mac_address' : pico_MAC, 'tilt_pico_configuration_files' : config_files })
+            response_builder.set_body_from_dict({'ip_address' : pico_IP, 'tilt_pico_version' : TP_ver,'tilt_pico_temperature_f' : temp_f, 'tilt_pico_mac_address' : pico_MAC, 'tilt_pico_configuration_files' : config_files, 'clock_synced' : clock_is_set(), 'last_time_sync' : last_ntp_sync })
         # try to serve static file
         else:
             response_builder.serve_static_file(request.url)
@@ -639,8 +772,10 @@ def log_to_csv(filename: str, data: list, max_size_kb: int = 180, header: list =
         file_size = os.stat(filename)[6]
 
     if file_size + line_to_add_bytes > max_bytes:
+        # Trim down to 75% of the cap (not just under it) so the full-file rewrite happens
+        # once every few hundred rows instead of on every row: far less flash wear.
         temp_filename = filename + '.tmp'
-        bytes_to_trim = (file_size + line_to_add_bytes) - max_bytes
+        bytes_to_trim = (file_size + line_to_add_bytes) - (max_bytes * 3 // 4)
         bytes_trimmed = 0
 
         try:
@@ -744,32 +879,66 @@ def get_pico_mac_address():
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     mac_bytes = wlan.config('mac')
-    mac_hex = bibinascii.hexlify(mac_bytes, ':').decode().upper()
-    
+    return binascii.hexlify(mac_bytes, ':').decode().upper()
+
+def ensure_dns(test_host='pool.ntp.org'):
+    # Some ISP gateways (e.g. Verizon) run a local DNS proxy that intermittently fails
+    # for IoT clients. Only if lookup through the DHCP-provided DNS fails, switch to a
+    # public resolver. network.ipconfig(dns=) changes DNS without disabling DHCP
+    # (unlike wlan.ifconfig((...)), which would pin a static IP and stop lease renewal).
+    try:
+        socket.getaddrinfo(test_host, 123)
+        print('DNS OK via current server')
+        return True
+    except OSError as e:
+        print(f'DNS lookup failed ({e}), trying fallback DNS {FALLBACK_DNS}')
+    original_dns = None
+    try:
+        original_dns = network.ipconfig('dns')
+        network.ipconfig(dns=FALLBACK_DNS)
+        socket.getaddrinfo(test_host, 123)
+        print('DNS OK via fallback server')
+        return True
+    except Exception as e:
+        # Both failed - most likely the internet itself is down (e.g. modem still booting).
+        # Go back to the router's DNS rather than pinning the fallback for no reason.
+        print(f'Fallback DNS also failed: {e}; keeping router DNS')
+        if original_dns:
+            try:
+                network.ipconfig(dns=original_dns)
+            except Exception:
+                pass
+        return False
+
 import machine
 import time
 import network
+
+def broadcast_ip(wlan):
+    # Advertise the Pico's IP to the app over iBeacon; only meaningful once DHCP has assigned one
+    global pico_IP
+    pico_IP = wlan.ifconfig()[0]
+    ipAddr = ip_to_uint16(pico_IP)
+    if ipAddr is not None and pico_IP != '0.0.0.0':
+        beacon.startiBeacon(ipAddr[0], ipAddr[1])
 
 def recover_wifi(ssid, password, max_attempts=3):
     for attempt in range(max_attempts):
         print(f"Recovery attempt {attempt + 1}/{max_attempts}")
         wlan = network.WLAN(network.STA_IF)
-        print(f"networks available: {len(wlan.scan())}")
-        if len(wlan.scan()) > 0:
+        networks_found = len(wlan.scan())  # scan once; each scan blocks for ~2s
+        print(f"networks available: {networks_found}")
+        if networks_found > 0:
             beacon.startiBeacon(999, 997) #notify app with iBeacon if possible
         if attempt == 0:           # Level 1: Normal reconnect
             wlan.connect(ssid, password)
-            ipAddr = ip_to_uint16(wlan.ifconfig()[0])
-            beacon.startiBeacon(ipAddr[0], ipAddr[1])
         elif attempt == 1:         # Level 2: Soft WiFi reset
             wlan.active(False)
             time.sleep(1)
             wlan.active(True)
             time.sleep(1)
             wlan.connect(ssid, password)
-            ipAddr = ip_to_uint16(wlan.ifconfig()[0])
-            beacon.startiBeacon(ipAddr[0], ipAddr[1])
-        else:                      # Level 3: Full power cycle
+        else:                     # Level 3: Full power cycle
             p = machine.Pin(23, machine.Pin.OUT)
             p.value(0)
             time.sleep(2)
@@ -780,11 +949,138 @@ def recover_wifi(ssid, password, max_attempts=3):
         while time.time() - start < 12:
             if wlan.isconnected():
                 print("Successfully reconnected!")
+                broadcast_ip(wlan)  # previously sent before connecting, which advertised 0.0.0.0
                 return True
             time.sleep(1)
     
     print("Recovery failed")
     return False
+
+async def finish_wifi_setup(wlan):
+    # Runs once Wi-Fi is up (first try or after recover_wifi): DNS check, clock sync, IP beacon
+    print(f"Connected to {SSID}, checking DNS")
+    ensure_dns()
+    print("syncing time with NTP")
+    if not await set_time_from_ntp():
+        # e.g. Wi-Fi came back before the modem after a power outage. Previously this
+        # soft-reset in a loop; now time_keeper() retries and logging waits for the clock.
+        print(f"NTP sync failed; retrying every {NTP_RETRY_S}s in the background, logging paused until then")
+    print("Connected to Wi-Fi")
+    persist_wifi_credentials()
+    broadcast_ip(wlan)
+    print(f"IP address: {pico_IP}")  # Print the IP address
+
+def file_exists(filename):
+    try:
+        os.stat(filename)
+        return True
+    except OSError:
+        return False
+
+def persist_wifi_credentials():
+    # Credentials just proved good, so make sure both copies exist. Previously the backup was
+    # only written when credentials came from the app in this boot, and a successful
+    # recover_wifi() left wifi.json deleted - so a router outage could strand the Pico
+    # waiting for the app with nothing to restore from.
+    if not file_exists('wifi.json'):
+        saveWiFi(SSID, KEY)
+    if creds_source == 'app' or not file_exists('wifi-backup.json'):
+        copy_file('wifi.json', 'wifi-backup.json')
+
+async def try_wifi_connect(wlan, ssid, password, timeout_s):
+    # Wi-Fi is only switched on while connecting; otherwise it stays off so BLE has the radio
+    wlan.active(True)
+    wlan.config(pm=0)
+    wlan.connect(ssid, password)
+    for _ in range(timeout_s * 10):
+        if wlan.isconnected():
+            return True
+        await asyncio.sleep_ms(100)
+    print(f"Could not connect to '{ssid}' (status {wlan.status()})")
+    wlan.disconnect()  # abort the background join before turning Wi-Fi off
+    wlan.active(False)
+    await asyncio.sleep_ms(200)
+    return False
+
+async def listen_for_app_credentials(min_listen_s):
+    # Listen (Wi-Fi off) for credentials from the app for at least min_listen_s, and never cut
+    # off a transfer in progress: keep listening while setup packets keep arriving.
+    # Returns True if a complete new set arrived (already saved to wifi.json by tiltscanner).
+    global SSID, KEY, wifi_config_scans, last_config_packet_ms, creds_received
+    # tiltscanner builds multi-part SSIDs by appending to the global, so start from empty
+    saved_ssid, saved_key = SSID, KEY
+    SSID, KEY = '', ''
+    wifi_config_scans = 0  # don't let the scanner fall back to wifi-backup.json mid-wait
+    last_config_packet_ms = None
+    creds_received = False
+    start = time.ticks_ms()
+    task = asyncio.create_task(tiltscanner(0, 'wifi_config'))
+    while not creds_received:
+        await asyncio.sleep_ms(250)
+        now = time.ticks_ms()
+        receiving = last_config_packet_ms is not None and time.ticks_diff(now, last_config_packet_ms) < WIFI_SETUP_IDLE_S * 1000
+        if not receiving and time.ticks_diff(now, start) >= min_listen_s * 1000:
+            break
+        if task.done() and not creds_received:
+            # scanner returned early without credentials; keep listening
+            task = asyncio.create_task(tiltscanner(0, 'wifi_config'))
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    if creds_received:
+        return True
+    if last_config_packet_ms is not None:
+        print("Setup from app started but did not complete")
+    SSID, KEY = saved_ssid, saved_key
+    return False
+
+async def wait_for_wifi_or_new_credentials(wlan, password):
+    # Saved credentials have connected before, so failing now most likely means the router is
+    # down (power outage, gateway rebooting). Keep them and keep retrying, but between retries
+    # listen for new credentials from the app so the user can still set up a different network.
+    # Returns the (decrypted) password that finally connected.
+    #
+    # Wi-Fi and BLE share the CYW43 chip and antenna. (Re)activating BLE while a Wi-Fi join is in
+    # progress can hang the chip, and an active join/scan for a missing AP starves BLE airtime so
+    # the app can't see the beacon or deliver credentials. So listening runs with Wi-Fi fully
+    # off - the same conditions as first-time setup mode - and reconnect attempts are suspended
+    # while the app is sending.
+    global SSID, KEY, creds_source, led_flash_interval
+    wlan.disconnect()
+    wlan.active(False)
+    await asyncio.sleep_ms(500)
+    print(f"Wi-Fi '{SSID}' unavailable: advertising 999/{WIFI_WAIT_BEACON_MINOR} and listening for setup from app")
+    beacon.startiBeacon(999, WIFI_WAIT_BEACON_MINOR)
+    attempt = 0
+    while True:
+        # Re-assert every cycle: tiltscanner switches blinking off when it receives credentials
+        led_flash_interval = [10, True]
+        old_ssid, old_key, old_source = SSID, KEY, creds_source
+        print(f"Listening {WIFI_WAIT_LISTEN_S}s for Wi-Fi setup from app (Wi-Fi off)")
+        if await listen_for_app_credentials(WIFI_WAIT_LISTEN_S):
+            print(f"New Wi-Fi credentials received from app for '{SSID}', connecting")
+            new_password = decrypt.decrypt_aes_cbc(KEY)
+            if await try_wifi_connect(wlan, SSID, new_password, WIFI_NEW_CREDS_CONNECT_S):
+                print("Connected with new credentials")
+                led_flash_interval = [10, False]
+                led.value(0)
+                return new_password
+            # Most likely a typo: keep the last good network and go straight back to listening
+            # so the user can resend from the app
+            print(f"New credentials failed; keeping '{old_ssid}' and listening again")
+            SSID, KEY, creds_source = old_ssid, old_key, old_source
+            saveWiFi(SSID, KEY)
+            continue
+        attempt += 1
+        print(f"Retry {attempt}: connecting to '{SSID}'")
+        if await try_wifi_connect(wlan, SSID, password, WIFI_WAIT_CONNECT_S):
+            print("Wi-Fi is back")
+            led_flash_interval = [10, False]
+            led.value(0)
+            return password
 
 # main coroutine to boot async tasks
 async def main():
@@ -802,6 +1098,9 @@ async def main():
     global failed_checks
     # start updating task
     asyncio.create_task(reset_button_reader())
+    # LED blink task runs for the whole session; it only blinks while led_flash_interval[1] is True
+    # (= waiting for Wi-Fi credentials / not connected)
+    asyncio.create_task(flash_led())
     try:
         with open('wifi.json', 'r') as f:
          data = ujson.load(f)
@@ -809,7 +1108,6 @@ async def main():
          KEY = data["KEY"]
     except:
         led_flash_interval = [10, True]
-        asyncio.create_task(flash_led())
         beacon.startiBeacon(999, 999)
         wifi_config_scans = 2000
         while not SSID_complete and not KEY_complete:
@@ -829,7 +1127,6 @@ async def main():
     decryptedKEY = decrypt.decrypt_aes_cbc(KEY)
     if not wlan.isconnected():
         print(f"Connecting to {SSID}...")
-        print(decryptedKEY)
         wlan.connect(SSID, decryptedKEY)  # Connect to the network
         # Wait for connection with timeout
         timeout = 20  # seconds
@@ -839,20 +1136,9 @@ async def main():
             await asyncio.sleep_ms(100)  # Non-blocking delay
     if wlan.isconnected():
         beacon.stopiBeacon()
-        print(f"Connected to {SSID}, syncing time with NTP")
-        if not await set_time_from_ntp():
-            beacon.startiBeacon(999, 998) # can't connect to NTP error beacon
-            time.sleep(5)
-            machine.soft_reset()
-        print("Connected to Wi-Fi")
-        pico_IP = wlan.ifconfig()[0]
-        print(f"IP address: {pico_IP}")  # Print the IP address
-        if SSID_complete and KEY_complete:
-            copy_file('wifi.json', 'wifi-backup.json')
-        ipAddr = ip_to_uint16(wlan.ifconfig()[0])
-        beacon.startiBeacon(ipAddr[0], ipAddr[1])
+        await finish_wifi_setup(wlan)
         led.value(0)
-    elif not wlan.isconnected():
+    else:
         beacon.stopiBeacon()
         print("Connection failed, trying again.")
         timeout = 10  # seconds
@@ -860,20 +1146,32 @@ async def main():
             if wlan.isconnected():
                 break
             await asyncio.sleep_ms(100)  # Non-blocking delay
-        print("Still not connected, resetting")
-        print(SSID, decryptedKEY)
-        if delete_file('wifi.json'):
-            await asyncio.sleep(5)
-            recover_wifi(SSID, decryptedKEY)
+        if wlan.isconnected():
+            # Connected during the extra wait: don't delete wifi.json or force recovery
+            await finish_wifi_setup(wlan)
+        elif creds_source == 'app':
+            # Credentials just entered in the app have never worked (most likely a typo): drop
+            # them and go back to setup mode. On reboot the last good network, if any, is
+            # restored from wifi-backup.json.
+            print(f"New credentials for {SSID} failed (status {wlan.status()}), returning to setup mode")
+            delete_file('wifi.json')
+            await asyncio.sleep(2)
+            p = machine.Pin(23, machine.Pin.OUT)
+            p.value(0)
+            time.sleep(2)
+            machine.reset()
         else:
-            recover_wifi(SSID, decryptedKEY)
-    else:
-        recover_wifi(SSID, decryptedKEY)
-        
+            # Saved credentials that worked before: never delete them just because the network
+            # is down. Retry until it's back (or the user sends new credentials from the app).
+            decryptedKEY = await wait_for_wifi_or_new_credentials(wlan, decryptedKEY)
+            await finish_wifi_setup(wlan)
+
     # start web server task
     print('Setting up webserver...')
     server = asyncio.start_server(handle_request, "0.0.0.0", 80)
     asyncio.create_task(server)
+    # keep the clock synced (retry if the internet wasn't up at boot; hourly drift correction)
+    asyncio.create_task(time_keeper())
 
     # main task to control automatic logging
     while True:
@@ -883,25 +1181,51 @@ async def main():
        if checkConnectionCounter % 10 == 0:
            print("checking WiFi connection")
            try:
-                response = requests.get(f"http://google.com/generate_204", timeout=10)
+                response = requests.get("http://clients3.google.com/generate_204", headers = { "User-Agent" : HTTP_HEADERS["User-Agent"] }, timeout=10)
+                status_code = response.status_code
                 response.close()
+                # Anything other than 204 means a captive portal / ISP block page answered
+                if status_code != 204:
+                    raise OSError(f"connectivity check returned HTTP {status_code}, expected 204")
                 checkConnectionCounter = 1
                 failed_checks = 0
                 gc.collect()
            except Exception as e:
                 failed_checks += 1
                 print(f"Request Error {failed_checks} of 3: {e}")
-                number_flashes = 0
+                checkConnectionCounter = 1
                 if failed_checks >= 3:
-                    while True:
-                        led.toggle()
-                        time.sleep(0.05)
-                        number_flashes += 1
-                        if number_flashes > 100:
-                            break   
-                    recover_wifi(SSID, decryptedKEY) # hard reset
-                else:
-                    checkConnectionCounter = 1
+                    if wlan.isconnected():
+                        # Wi-Fi is fine, the internet isn't (modem rebooting, ISP outage).
+                        # Rebooting the Pico can't fix that, so keep running and keep checking.
+                        print(f"Wi-Fi connected but internet unreachable ({failed_checks} failed checks); not resetting")
+                        if failed_checks % INTERNET_DOWN_REJOIN_CHECKS == 0:
+                            # Long outage: rejoin Wi-Fi (no reboot) in case the link went stale,
+                            # e.g. the router rebooted and our DHCP lease/IP is no longer valid
+                            print("Rejoining Wi-Fi after extended internet outage")
+                            wlan.disconnect()
+                            await asyncio.sleep(1)
+                            wlan.connect(SSID, decryptedKEY)
+                            for _ in range(200):  # up to 20s
+                                if wlan.isconnected():
+                                    break
+                                await asyncio.sleep_ms(100)
+                            if wlan.isconnected():
+                                broadcast_ip(wlan)  # IP may have changed
+                                print(f"Rejoined Wi-Fi, IP address: {pico_IP}")
+                    if not wlan.isconnected():
+                        # Wi-Fi itself is down: escalate (its last level reboots into the
+                        # wait-for-Wi-Fi / listen-for-app mode)
+                        number_flashes = 0
+                        while True:
+                            led.toggle()
+                            time.sleep(0.05)
+                            number_flashes += 1
+                            if number_flashes > 100:
+                                break
+                        led.value(0)
+                        if recover_wifi(SSID, decryptedKEY):
+                            failed_checks = 0  # recovered without a reboot; start counting afresh
                     
                     
 # start asyncio task and loop
